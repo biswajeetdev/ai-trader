@@ -53,6 +53,10 @@ from broker.risk        import (
 from signals.mean_reversion      import rsi_reversion_signal, get_pairs_signals
 from signals.screener            import get_screener_candidates
 from signals.polymarket_signals  import get_prediction_signals, format_for_llm as poly_fmt
+from signals.finbert_sentiment   import score_news_headlines as finbert_score
+from signals.param_optimizer     import run_optimization as ga_optimize
+from rag.self_improver           import get_calibration_prompt, record_signal_outcome, update_from_trade_history
+from broker.rl_sizer             import get_size_multiplier as bandit_size, update_bandit
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 DIR    = Path(__file__).parent
@@ -789,6 +793,11 @@ def main():
     # Market hours gate — crypto still runs always
     market_open = is_market_open()
 
+    try:
+        update_from_trade_history()  # bootstrap signal calibration from existing history
+    except Exception:
+        pass
+
     print("Authenticating...")
     token   = auth(cfg)
     profile = get_profile(token)
@@ -938,9 +947,13 @@ def main():
     trades_today    = []
 
     # ── Win-rate calibration (once per run, passed to arbiter) ───────────────
-    win_rate_data    = get_win_rate(n=20)
-    win_rate_summary = (win_rate_data.get("summary", "")
-                        if win_rate_data.get("win_rate") is not None else "")
+    win_rate_data  = get_win_rate(n=20)
+    _base_summary  = win_rate_data.get("summary", "") if win_rate_data.get("win_rate") is not None else ""
+    try:
+        _calib         = get_calibration_prompt()
+        win_rate_summary = (_base_summary + "\n" + _calib).strip() if _calib else _base_summary
+    except Exception:
+        win_rate_summary = _base_summary
 
     # Pairs mean reversion check (once per run)
     try:
@@ -1031,7 +1044,16 @@ def main():
                 qty = local_positions[symbol]["quantity"]
                 result = execute_trade(token, symbol, market, "SELL", qty, reason, dry_run)
                 if result and not dry_run:
+                    _entry = local_positions[symbol].get("entry_price", price)
                     record_close(symbol, price)
+                    try:
+                        _pnl_pct = (price / _entry - 1) * 100
+                        _regime_name = cfg.get("_bot_score", {}).get("regime", "MIXED")
+                        _win = stop_signal == "PROFIT_TARGET"
+                        update_bandit(_regime_name, float(macro.get("vix", 20)), 100, 1.0, _win)
+                        record_signal_outcome(symbol, "SELL", _pnl_pct, ["stop_exit"])
+                    except Exception:
+                        pass
                 trades_today.append({"symbol":symbol,"action":"SELL","quantity":qty,
                                       "reason":reason,"confidence":100,"result":result})
                 print()
@@ -1071,6 +1093,14 @@ def main():
                 rag_ctx = get_rag_context(symbol, market, ind)
             except Exception:
                 rag_ctx = ""
+
+            # FinBERT domain-tuned sentiment on news headlines
+            try:
+                _finbert = finbert_score(news_ctx, symbol) if news_ctx else ""
+                if _finbert:
+                    news_ctx = news_ctx + "\n" + _finbert
+            except Exception:
+                pass
 
             try:
                 bb_pat = detect_bb_pattern(df, ind)
@@ -1126,6 +1156,18 @@ def main():
                     qty = round(qty * size_mult, 6) if market=="crypto" else max(1,int(qty*size_mult))
                     reason += f" [size×{size_mult} — {regime.get('tier','?')} regime]"
 
+                # RL bandit size multiplier (learns optimal sizing from outcomes)
+                _bandit_mult = 1.0
+                if action == "BUY":
+                    try:
+                        _regime_name = cfg.get("_bot_score", {}).get("regime", "MIXED")
+                        _bandit_mult = bandit_size(_regime_name, float(macro.get("vix", 20)), conf)
+                        if _bandit_mult != 1.0:
+                            qty = round(qty * _bandit_mult, 6) if market == "crypto" else max(1, int(qty * _bandit_mult))
+                            reason += f" [bandit×{_bandit_mult}]"
+                    except Exception:
+                        pass
+
                 val = qty * price
                 print(f"   qty={qty}  value=${val:,.0f}  — {reason}")
 
@@ -1158,7 +1200,21 @@ def main():
                     if action == "BUY":
                         record_open(symbol, price, qty, ind["atr14"], market)
                     elif action in ("SELL","COVER") and symbol in local_positions:
+                        _entry = local_positions[symbol].get("entry_price", price)
                         record_close(symbol, price)
+                        try:
+                            _pnl_pct = (price / _entry - 1) * 100
+                            _signals_present = [k for k, v in {
+                                "options_flow": options_ctx, "whale": whale_ctx,
+                                "insider": ins_ctx, "news": news_ctx,
+                                "poly": poly_ctx, "social": social_ctx, "fg": fg_ctx,
+                            }.items() if v]
+                            record_signal_outcome(symbol, action, _pnl_pct, _signals_present)
+                            _regime_name = cfg.get("_bot_score", {}).get("regime", "MIXED")
+                            update_bandit(_regime_name, float(macro.get("vix", 20)),
+                                          conf, _bandit_mult, _pnl_pct > 0)
+                        except Exception:
+                            pass
                 trades_today.append({"symbol":symbol,"action":action,"quantity":qty,
                                       "reason":reason,"confidence":conf,
                                       "result":result,"alpaca":alpaca_result})

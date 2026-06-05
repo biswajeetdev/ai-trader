@@ -44,6 +44,22 @@ Respond ONLY with valid JSON, no markdown:
 {"action":"BUY"|"SELL"|"HOLD","confidence":<0-100>,"reason":"<one line citing top signal>","consensus":"STRONG"|"WEAK"|"SPLIT"}"""
 
 
+FUNDAMENTAL_SYSTEM = """\
+You are a fundamental analyst. Analyze the asset's valuation and growth metrics ONLY.
+Cite P/E, EPS growth, analyst ratings if provided. Ignore price action.
+One sentence conclusion. End with: FUNDAMENTAL: STRONG/FAIR/WEAK"""
+
+MACRO_SYSTEM = """\
+You are a macro economist. Analyze market regime conditions ONLY.
+Cite VIX level, yield curve, Fed rate, CPI if provided. Ignore stock-specific data.
+One sentence conclusion. End with: MACRO: BULLISH/NEUTRAL/BEARISH"""
+
+SENTIMENT_SYSTEM = """\
+You are a market sentiment analyst. Analyze crowd positioning ONLY.
+Cite Fear&Greed, social mentions, prediction market probabilities if provided.
+One sentence conclusion. End with: SENTIMENT: BULLISH/NEUTRAL/BEARISH"""
+
+
 def _call(client, model, system, user_msg, label):
     """Single LLM call — runs in thread."""
     resp = client.chat.completions.create(
@@ -52,6 +68,24 @@ def _call(client, model, system, user_msg, label):
                   {"role":"user",  "content":user_msg}]
     )
     return label, resp.choices[0].message.content.strip()
+
+
+def _run_specialists(client, model, ctx: str) -> dict:
+    """Run 3 specialist pre-analysts in parallel. Returns {fundamental, macro, sentiment}."""
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {
+            ex.submit(_call, client, model, FUNDAMENTAL_SYSTEM, ctx[:600], "fundamental"): "fundamental",
+            ex.submit(_call, client, model, MACRO_SYSTEM, ctx[:600], "macro"): "macro",
+            ex.submit(_call, client, model, SENTIMENT_SYSTEM, ctx[:600], "sentiment"): "sentiment",
+        }
+        results = {}
+        for fut in as_completed(futures):
+            try:
+                label, text = fut.result()
+                results[label] = text
+            except Exception:
+                pass
+    return results
 
 
 def debate_decide(symbol, market, ind, fund, macro, cash, social_ctx, insider_ctx,
@@ -91,11 +125,30 @@ SMA50: ${ind['sma50']} (above:{ind['above_sma50']}) | ATR ${ind['atr14']}
     if poly_ctx:
         ctx += f"\nPREDICTION MARKETS (crowd probability): {poly_ctx[:400]}"
 
+    # Run specialists first (parallel, cheap — short context window)
+    try:
+        specialists = _run_specialists(client, model, ctx)
+    except Exception:
+        specialists = {}
+    specialist_briefing = ""
+    if specialists:
+        lines = []
+        if specialists.get("fundamental"):
+            lines.append(f"FUNDAMENTAL ANALYST: {specialists['fundamental'][:120]}")
+        if specialists.get("macro"):
+            lines.append(f"MACRO ANALYST: {specialists['macro'][:120]}")
+        if specialists.get("sentiment"):
+            lines.append(f"SENTIMENT ANALYST: {specialists['sentiment'][:120]}")
+        specialist_briefing = "\n\nSPECIALIST BRIEFINGS (pre-read before arguing):\n" + "\n".join(lines)
+
+    # Append briefing to ctx for bull/bear
+    bull_bear_ctx = ctx + specialist_briefing
+
     # Run bull and bear in parallel
     with ThreadPoolExecutor(max_workers=2) as ex:
         futures = {
-            ex.submit(_call, client, model, BULL_SYSTEM, ctx, "bull"): "bull",
-            ex.submit(_call, client, model, BEAR_SYSTEM, ctx, "bear"): "bear",
+            ex.submit(_call, client, model, BULL_SYSTEM, bull_bear_ctx, "bull"): "bull",
+            ex.submit(_call, client, model, BEAR_SYSTEM, bull_bear_ctx, "bear"): "bear",
         }
         results = {}
         for fut in as_completed(futures):
@@ -106,7 +159,7 @@ SMA50: ${ind['sma50']} (above:{ind['above_sma50']}) | ATR ${ind['atr14']}
     bear_arg = results.get("bear", "No bearish case.")
 
     # Arbiter reads both
-    arbiter_msg = f"""BULL ANALYST says:\n{bull_arg}\n\nBEAR ANALYST says:\n{bear_arg}\n\nAsset context:\n{ctx[:400]}\nCash: ${cash:,.0f}"""
+    arbiter_msg = f"""BULL ANALYST says:\n{bull_arg}\n\nBEAR ANALYST says:\n{bear_arg}\n\nAsset context:\n{ctx[:400]}{specialist_briefing}\nCash: ${cash:,.0f}"""
 
     arbiter_system = ARBITER_SYSTEM
     if win_rate_summary:
@@ -149,14 +202,15 @@ SMA50: ${ind['sma50']} (above:{ind['above_sma50']}) | ATR ${ind['atr14']}
             qty = round(max_usd / price, 6)
 
     return {
-        "action":     action,
-        "quantity":   qty,
-        "confidence": confidence,
-        "reason":     reason,
-        "consensus":  consensus,
-        "bull_arg":   bull_arg[:200],
-        "bear_arg":   bear_arg[:200],
-        "reasoning":  {"technical": ctx[:200], "confidence": confidence},
+        "action":      action,
+        "quantity":    qty,
+        "confidence":  confidence,
+        "reason":      reason,
+        "consensus":   consensus,
+        "bull_arg":    bull_arg[:200],
+        "bear_arg":    bear_arg[:200],
+        "reasoning":   {"technical": ctx[:200], "confidence": confidence},
+        "specialists": {k: v[:100] for k, v in specialists.items()},
     }
 
 

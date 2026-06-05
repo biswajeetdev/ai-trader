@@ -26,6 +26,29 @@ PENDING_FILE = Path(__file__).parent.parent / "rag" / "pending_outcomes.json"
 OUTCOME_DAYS = 5   # check price change this many trading days after trade
 
 
+# ── temporal decay helpers ────────────────────────────────────────────────────
+
+def _age_days(date_str: str) -> float:
+    try:
+        dt = datetime.fromisoformat(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+    except Exception:
+        return 999.0
+
+def _get_tier(age: float) -> tuple:
+    if age <= 7:   return "SHORT",  1.0
+    if age <= 30:  return "MEDIUM", 0.6
+    return "LONG", 0.3
+
+def _tier_label(tier: str, age: float) -> str:
+    d = int(age)
+    if tier == "SHORT":  return f"[SHORT-TERM {d}d ago]"
+    if tier == "MEDIUM": return f"[MED-TERM {d}d ago]"
+    return f"[LONG-TERM {d}d ago]"
+
+
 # ── store new trade ───────────────────────────────────────────────────────────
 
 def record_trade_decision(symbol: str, market: str, ind: dict,
@@ -45,6 +68,8 @@ def record_trade_decision(symbol: str, market: str, ind: dict,
         "action":      action,
         "entry_price": price,
         "trade_date":  datetime.now(timezone.utc).isoformat(),
+        "stored_at":   datetime.now(timezone.utc).isoformat(),
+        "tier":        "SHORT",
         "outcome_due": (datetime.now(timezone.utc) +
                         timedelta(days=OUTCOME_DAYS * 1.5)).isoformat(),
         "resolved":    False,
@@ -134,16 +159,37 @@ def index_signals(social_signals: list, insider_signals: list):
 # ── retrieval for LLM ─────────────────────────────────────────────────────────
 
 def get_rag_context(symbol: str, market: str, ind: dict) -> str:
-    """
-    Single call that returns the full RAG context block for one asset.
-    Plugs directly into the LLM prompt.
-    """
-    patterns = retrieve_similar_patterns(symbol, ind, n=7)
+    """Single call that returns the full decay-weighted RAG context block for one asset."""
+    patterns = retrieve_similar_patterns(symbol, ind, n=10)
     if not patterns:
-        # Fall back to cross-symbol patterns (all assets)
-        patterns = retrieve_similar_patterns(symbol, ind, n=5,
-                                             same_symbol_only=False)
-    return format_patterns_for_llm(patterns, symbol)
+        patterns = retrieve_similar_patterns(symbol, ind, n=5, same_symbol_only=False)
+    if not patterns:
+        return format_patterns_for_llm([], symbol)
+
+    scored = []
+    for p in patterns:
+        ts = p.get("stored_at") or p.get("trade_date") or p.get("date", "")
+        age = _age_days(ts)
+        tier, decay = _get_tier(age)
+        scored.append((p, tier, age, decay, p["similarity"] * decay))
+
+    scored.sort(key=lambda x: x[4], reverse=True)
+    top = scored[:7]
+
+    wins  = sum(1 for p, *_ in top if p["outcome_pct"] > 0)
+    wr    = round(wins / len(top) * 100) if top else 0
+    lines = [f"HISTORICAL ANALOGUES for {symbol} (decay-weighted, most relevant first):"]
+    for p, tier, age, decay, _ in top[:5]:
+        icon   = "WIN" if p["outcome_pct"] > 0 else "LOSS"
+        label  = _tier_label(tier, age)
+        weight = f" (weight {decay})" if tier != "SHORT" else ""
+        lines.append(
+            f"  {label} {p['symbol']} {p['action']} {p['similarity']:.0%}"
+            f" → {p['outcome_pct']:+.1f}% {icon}{weight}"
+        )
+    avg = sum(p["outcome_pct"] for p, *_ in top) / len(top)
+    lines.append(f"  Base rate: {wr}% wins, avg outcome {avg:+.1f}% ({len(top)} analogues)")
+    return "\n".join(lines)
 
 
 # ── persistence helpers ───────────────────────────────────────────────────────
@@ -156,6 +202,48 @@ def _load_pending() -> dict:
 
 def _save_pending(data: dict):
     PENDING_FILE.write_text(json.dumps(data, indent=2))
+
+
+# ── tier stats ────────────────────────────────────────────────────────────────
+
+def get_tier_summary(symbol: str) -> str:
+    """Brief tier win-rate string for LLM calibration context."""
+    pending = _load_pending()
+    buckets = {"short": [], "medium": [], "long": []}
+    for trade in pending.values():
+        if not trade.get("resolved") or trade.get("symbol") != symbol:
+            continue
+        age = _age_days(trade.get("stored_at") or trade.get("trade_date", ""))
+        tier, _ = _get_tier(age)
+        buckets[tier.lower()].append(int(trade.get("outcome_pct", 0) > 0))
+
+    parts = []
+    labels = [("short", "Short-term", "7d"), ("medium", "Medium", "30d"), ("long", "Long", "90d")]
+    for key, name, span in labels:
+        wins = buckets[key]
+        if wins:
+            wr = round(sum(wins) / len(wins) * 100)
+            suffix = " rate" if key == "short" else ""
+            parts.append(f"{name} ({span}): {len(wins)} trades, {wr}% win{suffix}")
+    return " | ".join(parts) if parts else f"No trade history for {symbol}"
+
+
+def get_tier_stats() -> dict:
+    """Raw tier stats across all symbols: {short/medium/long: {count, win_rate}}."""
+    pending = _load_pending()
+    buckets = {"short": [], "medium": [], "long": []}
+    for trade in pending.values():
+        if not trade.get("resolved"):
+            continue
+        age = _age_days(trade.get("stored_at") or trade.get("trade_date", ""))
+        tier, _ = _get_tier(age)
+        buckets[tier.lower()].append(int(trade.get("outcome_pct", 0) > 0))
+
+    result = {}
+    for key, wins in buckets.items():
+        count = len(wins)
+        result[key] = {"count": count, "win_rate": round(sum(wins) / count * 100) if count else 0}
+    return result
 
 
 # ── stats ─────────────────────────────────────────────────────────────────────
