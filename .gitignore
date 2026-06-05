@@ -21,6 +21,8 @@ backtest_report.json
 god_mode_output.log
 god_mode_report.json
 god_mode_vbt_report.json
+pead_holds.json
+broker/bandit_state.json
 logs/
 *.log
 

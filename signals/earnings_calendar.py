@@ -12,6 +12,9 @@ from pathlib import Path
 CACHE_FILE = Path(__file__).parent.parent / "signals_cache.json"
 BLACKOUT_DAYS = 5   # HOLD within this many days of earnings
 
+PEAD_FILE = Path(__file__).parent.parent / "pead_holds.json"
+PEAD_HOLD_DAYS = 45
+
 
 def _cache(key, value=None, ttl=3600):
     try:
@@ -99,6 +102,7 @@ def earnings_signal(info):
     if surp is not None:
         if surp > 10:
             signal.append(f"Beat EPS by {surp}% last Q → post-earnings drift UP")
+            record_pead_beat(info.get('symbol', ''), surp)
             delta += 10
         elif surp > 0:
             signal.append(f"Slight EPS beat {surp}%")
@@ -110,7 +114,47 @@ def earnings_signal(info):
             signal.append(f"Slight EPS miss {surp}%")
             delta -= 5
 
+    pead_sig, pead_delta = get_pead_signal(info.get('symbol', ''))
+    if pead_sig:
+        signal.append(pead_sig)
+        delta += pead_delta
+
     return " | ".join(signal) if signal else "No earnings signal", delta
+
+
+def record_pead_beat(symbol: str, surprise_pct: float) -> None:
+    """Record a big EPS beat for PEAD drift tracking. Call after a >=10% surprise."""
+    data = json.loads(PEAD_FILE.read_text()) if PEAD_FILE.exists() else {}
+    data[symbol] = {
+        "surprise_pct": surprise_pct,
+        "recorded_on": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+    }
+    PEAD_FILE.write_text(json.dumps(data, indent=2))
+
+
+def get_pead_signal(symbol: str) -> tuple[str, int]:
+    """
+    Returns (signal_str, confidence_delta) for PEAD drift.
+    Positive delta = hold long (drift is ongoing).
+    """
+    if not PEAD_FILE.exists():
+        return "", 0
+    data = json.loads(PEAD_FILE.read_text())
+    entry = data.get(symbol)
+    if not entry:
+        return "", 0
+    try:
+        rec_date = datetime.strptime(entry["recorded_on"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        days_since = (datetime.now(timezone.utc) - rec_date).days
+        if days_since > PEAD_HOLD_DAYS:
+            del data[symbol]
+            PEAD_FILE.write_text(json.dumps(data, indent=2))
+            return "", 0
+        remaining = PEAD_HOLD_DAYS - days_since
+        surp = entry.get("surprise_pct", 0)
+        return (f"PEAD drift: {days_since}d since +{surp:.0f}% EPS beat ({remaining}d remaining)", 12)
+    except Exception:
+        return "", 0
 
 
 def get_all_earnings(watchlist_symbols, markets):

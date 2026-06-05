@@ -15,6 +15,7 @@ import pandas as pd
 from openai import OpenAI
 from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
+import pytz
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from signals.social_pulse      import get_social_signals,      format_for_llm as social_fmt
@@ -69,6 +70,17 @@ EXCEL  = DIR / "holdings.xlsx"
 LOG_MAX                = 500
 EARNINGS_BLACKOUT_DAYS = 5
 # STOP_LOSS_ATR, PROFIT_TARGET_ATR, MIN_CONFIDENCE, MAX_TRADE_USD live in broker.risk
+
+# ── Entry timing gate ─────────────────────────────────────────────────────────
+def _is_good_entry_window() -> bool:
+    """10:00-11:30 AM ET is the confirmed highest-Sharpe window. Block other times."""
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    hour, minute = now_et.hour, now_et.minute
+    # Allow: 10:00-11:30 AM ET, or Power Hour 3:00-3:45 PM ET
+    in_morning   = (hour == 10) or (hour == 11 and minute <= 30)
+    in_power_hour = (hour == 15 and minute <= 45)
+    return in_morning or in_power_hour
 
 # ── LLM backends ──────────────────────────────────────────────────────────────
 OLLAMA_URL    = "http://localhost:11434/v1"
@@ -1149,6 +1161,11 @@ def main():
                         print()
                         time.sleep(0.5)
                         continue
+
+                # Timing gate — only enter BUY during highest-Sharpe windows
+                if action == "BUY" and not _is_good_entry_window():
+                    print(f"   [TIMING] Skipping {symbol} BUY — outside optimal entry window (10-11:30 AM or 3-4 PM ET)")
+                    continue
 
                 # Apply regime size multiplier
                 size_mult = regime.get("size_mult", 1.0)

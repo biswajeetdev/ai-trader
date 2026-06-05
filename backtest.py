@@ -301,6 +301,7 @@ def run_asset(symbol, market, start, end, capital, params):
         "avg_hold_days":  avg_hold,
         "final_value":    round(eq.iloc[-1], 2),
         "trade_log":      trades,
+        "equity_series":  eq.to_dict(),
     }
 
 
@@ -308,10 +309,19 @@ def run_asset(symbol, market, start, end, capital, params):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--years",   type=int,   default=2)
-    ap.add_argument("--capital", type=float, default=100_000)
-    ap.add_argument("--params",  type=str,   default=None)
+    ap.add_argument("--years",       type=int,   default=2)
+    ap.add_argument("--capital",     type=float, default=100_000)
+    ap.add_argument("--params",      type=str,   default=None)
+    ap.add_argument("--funding-arb", action="store_true", help="Show Hyperliquid funding rates")
+    ap.add_argument("--tearsheet",   action="store_true", help="Generate QuantStats HTML tearsheet")
     args = ap.parse_args()
+
+    if getattr(args, 'funding_arb', False):
+        from broker.hyperliquid_arb import get_funding_arb_signals
+        signals = get_funding_arb_signals()
+        for s in signals:
+            print(f"{s['symbol']:6} {s['funding_ann']:>7.2f}% ann  {s['signal']:20}  {s['summary']}")
+        return
 
     params   = load_params(args.params)
     watchlist = json.loads((DIR / "config.json").read_text()).get("watchlist", [])
@@ -388,6 +398,24 @@ def main():
         print(f"  VERDICT: REFINE — avg {avg_ret:+.1f}%  PF {avg_pf:.2f}  "
               f"Run god_mode to find better params")
     print(f"{'='*64}\n")
+
+    # ── QuantStats tearsheets ─────────────────────────────────────────────────
+    if args.tearsheet:
+        try:
+            import quantstats
+            for r in results:
+                if not r.get("equity_series"):
+                    continue
+                eq = pd.Series(r["equity_series"])
+                if len(eq) < 5:
+                    continue
+                returns = eq.pct_change().dropna()
+                sym = r["symbol"]
+                out = f"backtest_{sym}.html"
+                quantstats.reports.html(returns, output=out, title=f"AI-Trader {sym}")
+                print(f"Tearsheet saved → {out}")
+        except ImportError:
+            print("Install quantstats: pip install quantstats")
 
     report = DIR / "backtest_report.json"
     report.write_text(json.dumps({

@@ -97,16 +97,16 @@ def check_stops(current_price: float, symbol: str) -> str | None:
     if not pos.get("partial_done") and atr > 0:
         if current_price >= entry + PARTIAL_TARGET_ATR * atr:
             return "PARTIAL_PROFIT"
-    # Update trailing stop upward when price rises
-    trail = pos.get("trail_stop")
-    if trail is not None:
-        new_trail = current_price - 3.0 * atr
-        if new_trail > trail:
-            pos["trail_stop"] = round(new_trail, 4)
-            positions[symbol] = pos
-            save_positions(positions)
-        if current_price <= pos.get("trail_stop", 0):
-            return "TRAIL_STOP"
+    # Chandelier trailing stop: init if unset, then ratchet upward only
+    if pos.get("trail_stop") is None:
+        pos["trail_stop"] = round(chandelier_exit([current_price], atr), 4)
+    new_trail = chandelier_exit([current_price], atr)
+    if new_trail > pos["trail_stop"]:
+        pos["trail_stop"] = round(new_trail, 4)
+    positions[symbol] = pos
+    save_positions(positions)
+    if current_price <= pos["trail_stop"]:
+        return "TRAIL_STOP"
     return None
 
 
@@ -205,6 +205,29 @@ def get_equity_history() -> list[float]:
     return hwm.get("equity_history", [])
 
 
+def vol_target_scalar(equity_history: list[float], target_vol: float = 0.12) -> float:
+    # Returns vol-target scalar [0.25, 2.0]; 1.0 if <21 obs or zero vol
+    if len(equity_history) < 21: return 1.0
+    ret = np.diff(equity_history) / np.array(equity_history[:-1])
+    rv = np.std(ret[-20:]) * np.sqrt(252)
+    return float(np.clip(target_vol / rv, 0.25, 2.0)) if rv > 0 else 1.0
+
+def chandelier_exit(high_series: list[float], atr: float, multiplier: float = 3.0) -> float:
+    return max(high_series) - multiplier * atr  # highest-high trailing stop
+
+def drawdown_radar_score(equity_history: list[float], vix: float = 20.0) -> int:
+    # Composite danger score 0-100; block new trades if >60
+    if len(equity_history) < 20:
+        return 0
+    ret = np.diff(equity_history) / np.array(equity_history[:-1])
+    v20 = float(np.std(ret[-20:]) * 252**0.5)
+    score  = 25 if (v20 > 0 and float(np.std(ret[-5:]) * 252**0.5) > 1.5 * v20) else 0
+    score += 25 if vix > 30 else (12 if vix > 20 else 0)
+    sharpe = float(np.mean(ret[-20:]) * 252 / v20) if v20 > 0 else 0.0
+    score += 34 if sharpe < 0 else (20 if sharpe < 0.5 else 0)
+    return int(np.clip(score, 0, 100))
+
+
 # ── Position sizing ───────────────────────────────────────────────────────────
 
 def _fixed_risk_size(
@@ -270,18 +293,17 @@ def kelly_position_size(price: float, atr: float, cash: float, confidence: int, 
 def size_position(
     price: float, atr: float, cash: float, confidence: int, market: str
 ) -> float:
-    """
-    Position size with automatic Kelly upgrade.
-    Uses Kelly criterion when >=5 closed trades exist; falls back to fixed 1% risk otherwise.
-    """
+    """Position size with automatic Kelly upgrade and volatility targeting."""
+    qty = _fixed_risk_size(price, atr, cash, confidence, market)
     if TRADE_HIST.exists():
         try:
             hist = json.loads(TRADE_HIST.read_text())
             if len(hist) >= 5:
-                return kelly_position_size(price, atr, cash, confidence, market)
+                qty = kelly_position_size(price, atr, cash, confidence, market)
         except Exception:
             pass
-    return _fixed_risk_size(price, atr, cash, confidence, market)
+    qty *= vol_target_scalar(get_equity_history())
+    return max(1, int(qty)) if market != "crypto" else round(qty, 6)
 
 
 # ── Trading edge formulas (Packt Ch6) ────────────────────────────────────────
@@ -473,3 +495,5 @@ def get_correlated_symbols(symbol: str, positions: dict, threshold: float = 0.7)
         return correlated
     except Exception:
         return []
+
+__all__ = ['size_position', 'kelly_position_size', 'check_stops', 'mark_partial_done', 'record_open', 'record_close', 'recent_trade_context', 'check_drawdown_circuit', 'get_equity_history', 'get_win_rate', 'vol_target_scalar', 'chandelier_exit', 'drawdown_radar_score']
