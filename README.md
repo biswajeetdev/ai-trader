@@ -12,7 +12,9 @@ An autonomous paper-trading research system that combines classical technical an
 trader.py                    ← main loop (runs every 30 min via launchd/cron)
 │
 ├── signals/                 ← parallel signal fetch (ThreadPoolExecutor)
-│   ├── debate_brain.py      ← BULL / BEAR / ARBITER multi-agent LLM debate
+│   ├── debate_brain.py      ← BULL / BEAR / ARBITER + FUNDAMENTAL/MACRO/SENTIMENT specialists
+│   ├── finbert_sentiment.py ← ProsusAI/FinBERT sentiment scoring (LM-dictionary fallback)
+│   ├── param_optimizer.py   ← genetic algorithm: evolves BB/ADX/ATR params via Sharpe fitness
 │   ├── regime.py            ← BotScore: VIX + SPY momentum → regime classification
 │   ├── screener.py          ← dynamic universe scanner (BB squeeze + ADX)
 │   ├── polymarket_signals.py← crowd probability from prediction markets
@@ -31,6 +33,7 @@ trader.py                    ← main loop (runs every 30 min via launchd/cron)
 │   └── india_signals.py     ← NSE bulk deals, India VIX
 │
 ├── broker/
+│   ├── rl_sizer.py          ← Thompson sampling bandit: learns position size per (regime, VIX, conf)
 │   ├── risk.py              ← Kelly sizing, stops, partial profit, circuit breaker
 │   ├── alpaca_exec.py       ← Alpaca paper (bracket orders: stop 3×ATR, target 7.5×ATR)
 │   ├── ai4trade.py          ← ai4trade.ai simulation broker
@@ -41,13 +44,36 @@ trader.py                    ← main loop (runs every 30 min via launchd/cron)
 │   └── telegram_notifier.py ← trade alerts + daily summary
 │
 ├── rag/
-│   └── pattern_memory.py    ← ChromaDB RAG: index past trades, query similar setups
+│   ├── pattern_memory.py    ← FinMem 3-tier temporal RAG (SHORT/MEDIUM/LONG decay weights)
+│   └── self_improver.py     ← QuantAgent outer loop: signal attribution → ARBITER calibration
 │
 ├── backtest.py              ← honest walk-forward backtest (no LLM, no lookahead)
 └── scripts/
     ├── server_setup.sh      ← Oracle Cloud Free Tier deploy script
     ├── trader.service        ← systemd oneshot service
     └── trader.timer          ← systemd timer (every 30 min)
+```
+
+---
+
+## Self-Evolving Intelligence
+
+The trader has four interlocking feedback loops that improve over time:
+
+| System | File | What it learns |
+|--------|------|----------------|
+| **FinMem temporal decay** | `rag/pattern_memory.py` | Recent trades (SHORT ≤7d) weighted 3× more than old ones (LONG >30d) |
+| **QuantAgent signal calibration** | `rag/self_improver.py` | Which signal sources (options, whale, insider, poly…) lead to wins → adjusts ARBITER prompts |
+| **RL contextual bandit** | `broker/rl_sizer.py` | Optimal position size multiplier [0.5–1.5×] per (regime, VIX bucket, confidence bucket) |
+| **Genetic param optimizer** | `signals/param_optimizer.py` | Auto-tunes 7 BB/ADX/ATR parameters using 90-day Sharpe fitness — run weekly |
+
+```
+Trade closes → record_signal_outcome() + update_bandit()
+                      ↓
+            calibration.json + bandit_state.json updated
+                      ↓
+          Next cycle: ARBITER sees updated weights
+                   + bandit size multiplier applied
 ```
 
 ---
