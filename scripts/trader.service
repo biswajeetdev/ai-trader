@@ -1,0 +1,17 @@
+[Unit]
+Description=AI-Trader Autonomous Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ai-trader
+ExecStart=/home/ubuntu/ai-trader/venv/bin/python3 trader.py
+StandardOutput=append:/home/ubuntu/ai-trader/logs/trader.log
+StandardError=append:/home/ubuntu/ai-trader/logs/trader.log
+Environment=PYTHONUNBUFFERED=1
+
+# Restart on failure
+Restart=on-failure
+RestartSec=30

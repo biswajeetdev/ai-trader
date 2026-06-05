@@ -1,0 +1,39 @@
+# secrets — never commit
+config.json
+*.env
+.env*
+.token
+*.token
+
+# runtime state
+positions.json
+portfolio_hwm.json
+trade_history.json
+log.json
+signals_cache.json
+cron.log
+cron.log.*.gz
+holdings.xlsx
+pending_trades.json
+short_put_positions.json
+pairs_spread.json
+backtest_report.json
+god_mode_output.log
+god_mode_report.json
+god_mode_vbt_report.json
+logs/
+*.log
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# graphify outputs
+graphify-out/
+
+# rag vector db
+rag/.chroma/
+rag/db/

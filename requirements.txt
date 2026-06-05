@@ -1,0 +1,11 @@
+requests>=2.31.0
+yfinance>=0.2.40
+pandas>=2.0.0
+openai>=1.0.0
+openpyxl>=3.1.0
+scipy>=1.11.0
+chromadb>=0.4.0
+alpaca-py>=0.13.0
+pyotp>=2.9.0
+feedparser>=6.0.0
+lxml>=4.9.0

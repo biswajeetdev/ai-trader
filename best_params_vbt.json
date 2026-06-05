@@ -1,0 +1,15 @@
+{
+  "params": {
+    "rsi_lo": 35,
+    "rsi_hi": 60,
+    "rsi_exit": 65,
+    "bb_entry": 0.7,
+    "bb_exit": 0.85,
+    "stop_atr": 3.0,
+    "target_mult": 2.5,
+    "macd_filter": true,
+    "sma200_req": true,
+    "risk_pct": 0.015
+  },
+  "score": 21.7926
+}

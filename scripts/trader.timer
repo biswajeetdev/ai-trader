@@ -1,0 +1,12 @@
+[Unit]
+Description=Run AI-Trader every 30 minutes (24/7 for crypto, market hours auto-gated)
+
+[Timer]
+# Every 30 minutes, all day, every day
+# Crypto trades 24/7 — the bot internally skips stocks when market is closed
+OnCalendar=*:0/30
+AccuracySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

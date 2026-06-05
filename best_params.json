@@ -1,0 +1,20 @@
+{
+  "found_at": "2026-06-02T01:31:28.777088",
+  "score": 21.7926,
+  "oos_return": 0.947,
+  "oos_win_rate": 67.6,
+  "oos_sharpe": 0.743,
+  "source": "vbt-walk-forward",
+  "params": {
+    "rsi_buy_min": 35,
+    "rsi_buy_max": 60,
+    "rsi_sell": 65,
+    "bb_buy_max": 0.7,
+    "bb_sell_min": 0.85,
+    "use_sma200": true,
+    "macd_required": true,
+    "stop_atr": 3.0,
+    "target_atr": 7.5,
+    "risk_pct": 0.015
+  }
+}
