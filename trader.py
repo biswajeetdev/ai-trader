@@ -58,6 +58,17 @@ from signals.finbert_sentiment   import score_news_headlines as finbert_score
 from signals.param_optimizer     import run_optimization as ga_optimize
 from rag.self_improver           import get_calibration_prompt, record_signal_outcome, update_from_trade_history
 from broker.rl_sizer             import get_size_multiplier as bandit_size, update_bandit
+from signals.leveraged_etf       import get_leveraged_etf_signal
+from signals.dividend_capture    import get_dividend_signal
+from signals.cot_signal          import get_cot_signal
+from signals.short_interest      import get_short_interest_signal
+from broker.merger_arb           import get_arb_signal
+from broker.short_exec           import execute_short_sell, cover_short
+from broker.wheel_tracker        import get_assignable_symbols, update_wheel_state
+from rag.strategy_evolver        import (
+    record_strategy_outcome, get_strategy_allocation_prompt,
+    get_recent_lessons, bootstrap_from_trade_history,
+)
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 DIR    = Path(__file__).parent
@@ -87,7 +98,6 @@ OLLAMA_URL    = "http://localhost:11434/v1"
 OLLAMA_MODELS = ["qwen2.5:32b", "deepseek-r1:14b", "llama3.3:70b", "llama3.1:8b", "phi4"]
 GITHUB_MODEL       = "gpt-4o-mini"  # 50 req/min limit (gpt-4o was 50/day — hit every day)
 GITHUB_MODEL_FAST  = "gpt-4o-mini"  # debate brain: same model, 50 req/min
-ANTHROPIC_MDL = "claude-sonnet-4-6"
 
 VALID_ACTIONS = {"BUY", "SELL", "SHORT", "COVER", "HOLD"}
 VALID_MARKETS = {"us-stock", "crypto", "polymarket", "a-stock", "in-stock"}
@@ -130,14 +140,7 @@ def detect_llm_backend():
                         GITHUB_MODEL, f"{GITHUB_MODEL} via GitHub Models (free)")
         return _LLM_BACKEND
 
-    # 3. Anthropic (via openai-compat isn't available — flag for main to handle)
-    cfg_key = _read_config_raw().get("anthropic_api_key", "")
-    ant_key = os.environ.get("ANTHROPIC_API_KEY") or cfg_key
-    if ant_key:
-        _LLM_BACKEND = (None, ANTHROPIC_MDL, "claude-sonnet-4-6 via Anthropic")
-        return _LLM_BACKEND
-
-    sys.exit("[error] No LLM backend. Run 'gh auth login' or set ANTHROPIC_API_KEY.")
+    sys.exit("[error] No LLM backend available. Run: gh auth login")
 
 
 def _read_config_raw():
@@ -147,9 +150,6 @@ def _read_config_raw():
 def load_config():
     with open(CONFIG) as f:
         cfg = json.load(f)
-    cfg["anthropic_api_key"] = (
-        os.environ.get("ANTHROPIC_API_KEY") or cfg.get("anthropic_api_key", "")
-    )
     for item in cfg.get("watchlist", []):
         if item.get("market") not in VALID_MARKETS:
             sys.exit(f"[error] Unknown market '{item.get('market')}'")
@@ -479,18 +479,10 @@ def llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_position=False):
                 f"GOVT/INSIDER TRADES:\n{insider_str}"
                 f"{pos_context}\nCash: ${cash:,.0f}")
 
-    # Anthropic path
-    if client is None:
-        import anthropic as ant
-        ac  = ant.Anthropic(api_key=cfg["anthropic_api_key"])
-        msg = ac.messages.create(model=model, max_tokens=350, system=system,
-                                  messages=[{"role":"user","content":user_msg}])
-        raw = msg.content[0].text.strip()
-    else:
-        resp = client.chat.completions.create(
+    resp = client.chat.completions.create(
             model=model, max_tokens=350, temperature=0.1,
             messages=[{"role":"system","content":system},{"role":"user","content":user_msg}])
-        raw = resp.choices[0].message.content.strip().lstrip("```json").rstrip("```").strip()
+    raw = resp.choices[0].message.content.strip().lstrip("```json").rstrip("```").strip()
 
     dec        = json.loads(raw)
     reasoning  = dec.get("reasoning", {})
@@ -806,7 +798,8 @@ def main():
     market_open = is_market_open()
 
     try:
-        update_from_trade_history()  # bootstrap signal calibration from existing history
+        update_from_trade_history()    # bootstrap signal calibration from existing history
+        bootstrap_from_trade_history() # bootstrap strategy bandit from trade history
     except Exception:
         pass
 
@@ -1216,7 +1209,23 @@ def main():
                 if result and not dry_run:
                     if action == "BUY":
                         record_open(symbol, price, qty, ind["atr14"], market)
-                    elif action in ("SELL","COVER") and symbol in local_positions:
+                        try:
+                            record_strategy_outcome(symbol, "LONG_MOMENTUM", 0)
+                        except Exception:
+                            pass
+                    elif action == "SHORT" and not dry_run:
+                        # Execute short sell via Alpaca
+                        try:
+                            _short_result = execute_short_sell(cfg, symbol, qty)
+                            if "error" not in _short_result:
+                                record_open(symbol, price, -qty, ind["atr14"], market)
+                                record_strategy_outcome(symbol, "SHORT_REVERSION", 0)
+                                print(f"   [SHORT] Alpaca: {_short_result.get('order_id','')[:8]}...")
+                            else:
+                                print(f"   [SHORT] Error: {_short_result['error']}")
+                        except Exception as _e:
+                            print(f"   [SHORT] Exception: {_e}")
+                    elif action in ("SELL", "COVER") and symbol in local_positions:
                         _entry = local_positions[symbol].get("entry_price", price)
                         record_close(symbol, price)
                         try:
@@ -1230,6 +1239,9 @@ def main():
                             _regime_name = cfg.get("_bot_score", {}).get("regime", "MIXED")
                             update_bandit(_regime_name, float(macro.get("vix", 20)),
                                           conf, _bandit_mult, _pnl_pct > 0)
+                            _entry_ctx = {"regime": _regime_name, "rsi": ind.get("rsi14"),
+                                          "vix": macro.get("vix"), "signals": _signals_present}
+                            record_strategy_outcome(symbol, "LONG_MOMENTUM", _pnl_pct, _entry_ctx)
                         except Exception:
                             pass
                 trades_today.append({"symbol":symbol,"action":action,"quantity":qty,

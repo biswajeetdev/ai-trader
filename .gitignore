@@ -23,6 +23,8 @@ god_mode_report.json
 god_mode_vbt_report.json
 pead_holds.json
 broker/bandit_state.json
+broker/wheel_state.json
+broker/covered_call_positions.json
 logs/
 *.log
 
@@ -39,3 +41,4 @@ graphify-out/
 # rag vector db
 rag/.chroma/
 rag/db/
+rag/strategy_calibration.json
