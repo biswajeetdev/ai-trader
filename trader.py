@@ -960,6 +960,14 @@ def main():
     except Exception:
         win_rate_summary = _base_summary
 
+    # ── Strategy self-evolution (bandit scores + post-mortem lessons) ─────────
+    try:
+        strategy_ctx = get_strategy_allocation_prompt()
+        lessons_ctx  = get_recent_lessons(5)
+    except Exception:
+        strategy_ctx = ""
+        lessons_ctx  = ""
+
     # Pairs mean reversion check (once per run)
     try:
         pairs_sigs = get_pairs_signals()
@@ -1122,7 +1130,9 @@ def main():
                                     bb_pattern_ctx=bb_pattern_ctx,
                                     win_rate_summary=win_rate_summary,
                                     rank_ctx=rank_ctx,
-                                    poly_ctx=poly_ctx)
+                                    poly_ctx=poly_ctx,
+                                    strategy_ctx=strategy_ctx,
+                                    lessons_ctx=lessons_ctx)
                 print(f"   [{dec.get('consensus','?')} consensus]  "
                       f"Bull: {dec.get('bull_arg','')[:60]}...")
                 print(f"   Bear: {dec.get('bear_arg','')[:60]}...")

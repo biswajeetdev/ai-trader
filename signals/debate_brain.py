@@ -91,7 +91,7 @@ def _run_specialists(client, model, ctx: str) -> dict:
 def debate_decide(symbol, market, ind, fund, macro, cash, social_ctx, insider_ctx,
                   earn_str, cfg, news_ctx="", options_ctx="", whale_ctx="", fg_ctx="",
                   rag_ctx="", bb_pattern_ctx="", win_rate_summary="", rank_ctx="",
-                  poly_ctx=""):
+                  poly_ctx="", strategy_ctx="", lessons_ctx=""):
     """
     Run bull/bear debate in parallel, arbiter makes final call.
     Returns same format as llm_decide: {action, quantity, confidence, reason, reasoning}
@@ -162,13 +162,19 @@ SMA50: ${ind['sma50']} (above:{ind['above_sma50']}) | ATR ${ind['atr14']}
     arbiter_msg = f"""BULL ANALYST says:\n{bull_arg}\n\nBEAR ANALYST says:\n{bear_arg}\n\nAsset context:\n{ctx[:400]}{specialist_briefing}\nCash: ${cash:,.0f}"""
 
     arbiter_system = ARBITER_SYSTEM
+    prefix_blocks = []
     if win_rate_summary:
-        arbiter_system = (
+        prefix_blocks.append(
             f"PERFORMANCE CALIBRATION — your recent track record:\n{win_rate_summary}\n"
             f"If win rate < 45%, be MORE conservative (raise confidence threshold). "
-            f"If win rate > 60%, maintain current threshold.\n\n"
-            + ARBITER_SYSTEM
+            f"If win rate > 60%, maintain current threshold."
         )
+    if strategy_ctx:
+        prefix_blocks.append(strategy_ctx)
+    if lessons_ctx:
+        prefix_blocks.append(f"LEARNED LESSONS FROM PAST LOSSES (apply these rules):\n{lessons_ctx}")
+    if prefix_blocks:
+        arbiter_system = "\n\n".join(prefix_blocks) + "\n\n" + ARBITER_SYSTEM
 
     _, arbiter_raw = _call(client, model, arbiter_system, arbiter_msg, "arbiter")
     arbiter_raw = arbiter_raw.lstrip("```json").rstrip("```").strip()
