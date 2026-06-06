@@ -8,6 +8,7 @@ import json
 import math
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -41,10 +42,13 @@ def _daily_returns(equity: list[float]) -> np.ndarray:
     if len(equity) < 2:
         return np.array([])
     arr = np.array(equity, dtype=float)
+    arr = arr[arr != 0]  # drop zero snapshots (pre-deposit initialisation values)
+    if len(arr) < 2:
+        return np.array([])
     return np.diff(arr) / arr[:-1]
 
 
-def sharpe_ratio(equity: list[float]) -> float | None:
+def sharpe_ratio(equity: list[float]) -> Optional[float]:
     rets = _daily_returns(equity)
     if len(rets) < 20:
         return None
@@ -56,7 +60,7 @@ def sharpe_ratio(equity: list[float]) -> float | None:
     return round(float(np.mean(excess) / std * math.sqrt(TRADING_DAYS)), 3)
 
 
-def sortino_ratio(equity: list[float]) -> float | None:
+def sortino_ratio(equity: list[float]) -> Optional[float]:
     rets = _daily_returns(equity)
     if len(rets) < 20:
         return None
@@ -90,11 +94,12 @@ def win_rate_and_profit_factor(trades: list[dict]) -> dict:
     losses = [t["pnl"] for t in closed if t["pnl"] <= 0]
 
     gross_profit = sum(wins)
-    gross_loss   = abs(sum(losses)) or 1e-9
+    gross_loss   = abs(sum(losses))
+    profit_factor = round(gross_profit / gross_loss, 3) if gross_loss > 0 else None
 
     return {
         "win_rate":       round(len(wins) / len(closed), 4),
-        "profit_factor":  round(gross_profit / gross_loss, 3),
+        "profit_factor":  profit_factor,
         "total_trades":   len(closed),
         "winning_trades": len(wins),
         "losing_trades":  len(losses),
@@ -103,14 +108,15 @@ def win_rate_and_profit_factor(trades: list[dict]) -> dict:
     }
 
 
-def avg_hold_days(trades: list[dict]) -> float | None:
+def avg_hold_days(trades: list[dict]) -> Optional[float]:
     durations = []
     for t in trades:
         try:
             entry = datetime.fromisoformat(t["entry_date"])
             exit_ = datetime.fromisoformat(t.get("exit_date") or t.get("close_date") or "")
             durations.append((exit_ - entry).days)
-        except Exception:
+        except Exception as e:
+            print(f"[perf] skipping trade in avg_hold_days: {e}")
             continue
     if not durations:
         return None
