@@ -69,6 +69,7 @@ from rag.strategy_evolver        import (
     record_strategy_outcome, get_strategy_allocation_prompt,
     get_recent_lessons, bootstrap_from_trade_history,
 )
+import dashboard.state as dash_state
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 DIR    = Path(__file__).parent
@@ -794,6 +795,19 @@ def main():
     print(f"  Market : {'OPEN' if is_market_open() else 'CLOSED'}")
     print(f"{'='*62}\n")
 
+    # Launch Bloomberg terminal in a new Terminal.app window
+    dash_state.set_status("RUNNING")
+    try:
+        import subprocess as _sp
+        _dash = Path(__file__).parent / "dashboard" / "terminal.py"
+        _sp.Popen(
+            ["osascript", "-e",
+             f'tell app "Terminal" to do script "python3 {_dash}"'],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        )
+    except Exception:
+        pass
+
     # Market hours gate — crypto still runs always
     market_open = is_market_open()
 
@@ -808,6 +822,7 @@ def main():
     profile = get_profile(token)
     cash    = float(profile.get("cash", 100_000))
     print(f"Account : {profile.get('name')}  |  Cash: ${cash:,.2f}\n")
+    dash_state.update_account(equity=float(profile.get('portfolio_value', cash)), cash=cash)
 
     # ── Drawdown circuit breaker (persists across runs via portfolio_hwm.json) ─
     dd_halted, port_value, dd_pct, peak = check_drawdown_circuit(token, cash)
@@ -837,6 +852,13 @@ def main():
     if macro.get("vix"):
         print(f"  VIX {macro['vix']} ({macro['vix_level']}) | "
               f"QQQ {macro.get('qqq_5d_pct','?')}% | SPY {macro.get('spy_5d_pct','?')}%")
+    dash_state.update_macro(
+        vix=float(macro.get("vix") or 0),
+        spy_5d=float(macro.get("spy_5d_pct") or 0),
+        fg_score=int(macro.get("fear_greed", 0) or 0),
+        bot_score=cfg.get("_bot_score", {}).get("score", 50),
+        regime=cfg.get("_bot_score", {}).get("regime", ""),
+    )
 
     # Cross-sectional ranking (Auquan + Packt Ch4) — ranks US stocks vs SPY
     print("Computing cross-sectional rankings...")
@@ -950,6 +972,7 @@ def main():
 
     local_positions = load_positions()
     trades_today    = []
+    dash_state.update_positions(list(local_positions.values()))
 
     # ── Win-rate calibration (once per run, passed to arbiter) ───────────────
     win_rate_data  = get_win_rate(n=20)
@@ -967,6 +990,23 @@ def main():
     except Exception:
         strategy_ctx = ""
         lessons_ctx  = ""
+
+    # Push strategy/lesson state to dashboard
+    try:
+        from rag.strategy_evolver import _load as _se_load
+        _se_data = _se_load()
+        dash_state.update_strategies(_se_data.get("strategies", {}))
+        dash_state.update_lessons([
+            f"[{pm['date']}] {pm['symbol']} — {pm.get('lesson', pm.get('diagnosis',''))[:90]}"
+            for pm in _se_data.get("post_mortems", [])[-6:]
+        ])
+    except Exception:
+        pass
+    if win_rate_data.get("win_rate") is not None:
+        dash_state.update_win_rate(
+            rate=float(win_rate_data["win_rate"]) * 100,
+            trades=win_rate_data.get("n_trades", 0),
+        )
 
     # Pairs mean reversion check (once per run)
     try:
@@ -988,6 +1028,7 @@ def main():
             continue
 
         print(f"── {symbol} ({market})")
+        dash_state.set_current_symbol(symbol)
         try:
             if market == "crypto":
                 ticker = f"{symbol}-USD"
@@ -1136,6 +1177,13 @@ def main():
                 print(f"   [{dec.get('consensus','?')} consensus]  "
                       f"Bull: {dec.get('bull_arg','')[:60]}...")
                 print(f"   Bear: {dec.get('bear_arg','')[:60]}...")
+                dash_state.add_signal_event(
+                    symbol=symbol, action=dec.get("action","HOLD"),
+                    conf=dec.get("confidence", 0),
+                    bull=dec.get("bull_arg",""), bear=dec.get("bear_arg",""),
+                    consensus=dec.get("consensus","SPLIT"),
+                    reason=dec.get("reason",""),
+                )
             except Exception as e:
                 # fallback to single LLM if debate fails
                 dec = llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_pos)
@@ -1215,6 +1263,8 @@ def main():
 
                 send_trade_alert(cfg, action, symbol, qty, price, reason, conf,
                                  alpaca_order_id=alpaca_result.get("alpaca_order_id", ""))
+                dash_state.add_trade(action=action, symbol=symbol,
+                                     qty=qty, price=price, reason=reason)
 
                 if result and not dry_run:
                     if action == "BUY":
@@ -1342,6 +1392,11 @@ def main():
     # Per-run Telegram heartbeat — always fires so user sees the bot is alive
     sp_open = len(sp_load_positions()) + len(india_sp_load_positions())
     send_run_status(cfg, cash, trades_today, len(load_positions()), sp_open)
+
+    # Final dashboard state update
+    dash_state.set_status("IDLE")
+    dash_state.set_current_symbol("")
+    dash_state.update_positions(list(load_positions().values()))
 
     # Daily summary email at market close
     if is_near_close() and not dry_run:
