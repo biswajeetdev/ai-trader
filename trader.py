@@ -69,6 +69,7 @@ from rag.strategy_evolver        import (
     record_strategy_outcome, get_strategy_allocation_prompt,
     get_recent_lessons, bootstrap_from_trade_history,
 )
+from broker.performance import get_performance_report, format_for_summary as perf_summary
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 DIR    = Path(__file__).parent
@@ -596,6 +597,8 @@ Today's trades:
     if not trades_today:
         body += "  No trades executed today (all HOLD or market closed)\n"
 
+    perf = get_performance_report()
+    body += "\n" + perf_summary(perf) + "\n"
     body += "\nDashboard: https://ai4trade.ai/agent/10954"
 
     msg = MIMEText(body)
