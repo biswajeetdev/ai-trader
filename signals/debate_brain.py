@@ -15,15 +15,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 BULL_SYSTEM = """\
-You are an aggressive bull trader. Your job is to make the STRONGEST possible \
-bullish case for this asset using ONLY the data provided. Cite specific numbers. \
-Be concise. End with: VERDICT: BUY (confidence X%) or VERDICT: HOLD (X%).
+You are GrowthBull — think Peter Lynch meets Cathie Wood. Make the STRONGEST bullish case: \
+breakout momentum, TAM expansion, institutional accumulation, earnings beat potential. \
+Cite specific numbers. End with: VERDICT: BUY (confidence X%) or VERDICT: HOLD (X%).
 Respond in under 80 words."""
 
 BEAR_SYSTEM = """\
-You are a disciplined short-seller. Your job is to make the STRONGEST possible \
-bearish case for this asset using ONLY the data provided. Cite specific numbers. \
-Be concise. End with: VERDICT: SELL (confidence X%) or VERDICT: HOLD (X%).
+You are ValueBear — think Charlie Munger meets Howard Marks. Make the STRONGEST bearish case: \
+margin of safety violated, overvaluation, deteriorating fundamentals, smart-money distribution. \
+Cite specific numbers. End with: VERDICT: SELL (confidence X%) or VERDICT: HOLD (X%).
 Respond in under 80 words."""
 
 ARBITER_SYSTEM = """\
@@ -91,7 +91,8 @@ def _run_specialists(client, model, ctx: str) -> dict:
 def debate_decide(symbol, market, ind, fund, macro, cash, social_ctx, insider_ctx,
                   earn_str, cfg, news_ctx="", options_ctx="", whale_ctx="", fg_ctx="",
                   rag_ctx="", bb_pattern_ctx="", win_rate_summary="", rank_ctx="",
-                  poly_ctx="", strategy_ctx="", lessons_ctx=""):
+                  poly_ctx="", strategy_ctx="", lessons_ctx="",
+                  memory_ctx="", sentiment_ctx=""):
     """
     Run bull/bear debate in parallel, arbiter makes final call.
     Returns same format as llm_decide: {action, quantity, confidence, reason, reasoning}
@@ -124,6 +125,10 @@ SMA50: ${ind['sma50']} (above:{ind['above_sma50']}) | ATR ${ind['atr14']}
         ctx += f"\nCROSS-SECTIONAL RANK (vs SPY + peers): {rank_ctx}"
     if poly_ctx:
         ctx += f"\nPREDICTION MARKETS (crowd probability): {poly_ctx[:400]}"
+    if sentiment_ctx:
+        ctx += f"\nSOCIAL SENTIMENT (live): {sentiment_ctx[:300]}"
+    if memory_ctx:
+        ctx += f"\n{memory_ctx[:500]}"
 
     # Run specialists first (parallel, cheap — short context window)
     try:
@@ -173,6 +178,8 @@ SMA50: ${ind['sma50']} (above:{ind['above_sma50']}) | ATR ${ind['atr14']}
         prefix_blocks.append(strategy_ctx)
     if lessons_ctx:
         prefix_blocks.append(f"LEARNED LESSONS FROM PAST LOSSES (apply these rules):\n{lessons_ctx}")
+    if memory_ctx:
+        prefix_blocks.append(memory_ctx[:500])
     if prefix_blocks:
         arbiter_system = "\n\n".join(prefix_blocks) + "\n\n" + ARBITER_SYSTEM
 

@@ -15,6 +15,7 @@ _EMPTY: dict = {
     "signal_feed": [], "trade_log": [],
     "strategies": {}, "lessons": [],
     "radar": {}, "win_rate": {},
+    "pipeline": {},
     "current_symbol": "", "status": "IDLE",
     "last_updated": None,
 }
@@ -148,6 +149,18 @@ def update_lessons(lessons: list) -> None:
 def update_radar(score: int, level: str) -> None:
     with _lock:
         d = _load(); d["radar"] = {"score": score, "level": level}; _save(d)
+
+
+def update_pipeline(stage: str, status: str, latency_ms: int = 0) -> None:
+    """Update a pipeline stage. stage e.g. 'yfinance','debate','arbiter','alpaca'."""
+    with _lock:
+        d = _load()
+        d.setdefault("pipeline", {})[stage] = {
+            "status":     status,
+            "latency_ms": latency_ms,
+            "ts":         datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        }
+        _save(d)
 
 
 def update_win_rate(rate: float, trades: int) -> None:

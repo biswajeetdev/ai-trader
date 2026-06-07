@@ -21,6 +21,7 @@ STRATEGY_TYPES = [
     "PAIRS_LONG", "PAIRS_SHORT", "DIV_CAPTURE", "MERGER_ARB",
     "LEVERAGED_ETF_BULL", "LEVERAGED_ETF_BEAR",
 ]
+LLM_MODELS_DEFAULT = ["gpt-4o-mini", "gpt-4o", "o1-mini"]
 
 
 def _default_entry() -> dict:
@@ -36,7 +37,7 @@ def _load() -> dict:
     except Exception:
         pass
     return {"strategies": {s: _default_entry() for s in STRATEGY_TYPES},
-            "post_mortems": [], "seen_trades": [], "last_updated": None}
+            "llm_bandit": {}, "post_mortems": [], "seen_trades": [], "last_updated": None}
 
 
 def _save(data: dict) -> None:
@@ -176,3 +177,32 @@ def get_recent_lessons(n: int = 5) -> str:
         )
     except Exception:
         return ""
+
+
+def record_llm_outcome(model: str, won: bool) -> None:
+    """Track which LLM model generates winning signals via Thompson sampling."""
+    data = _load()
+    bandit = data.setdefault("llm_bandit", {})
+    entry  = bandit.setdefault(model, {"alpha": 1, "beta": 1, "wins": 0, "losses": 0})
+    if won:
+        entry["alpha"] += 1; entry["wins"] += 1
+    else:
+        entry["beta"]  += 1; entry["losses"] += 1
+    _save(data)
+
+
+def get_best_llm(candidates: list) -> str:
+    """Return the candidate model with best Thompson sampling score.
+    Falls back to first candidate if no data yet."""
+    if not candidates:
+        return "gpt-4o-mini"
+    try:
+        bandit = _load().get("llm_bandit", {})
+        def _score(m):
+            e = bandit.get(m, {"alpha": 1, "beta": 1})
+            return e["alpha"] / (e["alpha"] + e["beta"])
+        best = max(candidates, key=_score)
+        scores = {m: f"{_score(m):.2f}" for m in candidates}
+        return best
+    except Exception:
+        return candidates[0]

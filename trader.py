@@ -68,7 +68,10 @@ from broker.wheel_tracker        import get_assignable_symbols, update_wheel_sta
 from rag.strategy_evolver        import (
     record_strategy_outcome, get_strategy_allocation_prompt,
     get_recent_lessons, bootstrap_from_trade_history,
+    record_llm_outcome, get_best_llm,
 )
+from rag.trading_memory  import append_decision, get_memory_context, update_outcome
+from signals.sentiment_fetch import get_sentiment
 import dashboard.state as dash_state
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -795,16 +798,21 @@ def main():
     print(f"  Market : {'OPEN' if is_market_open() else 'CLOSED'}")
     print(f"{'='*62}\n")
 
-    # Launch Bloomberg terminal in a new Terminal.app window
+    # Launch Bloomberg terminal only if not already running
     dash_state.set_status("RUNNING")
     try:
         import subprocess as _sp
         _dash = Path(__file__).parent / "dashboard" / "terminal.py"
-        _sp.Popen(
-            ["osascript", "-e",
-             f'tell app "Terminal" to do script "python3 {_dash}"'],
+        _already = _sp.run(
+            ["pgrep", "-f", "dashboard/terminal.py"],
             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-        )
+        ).returncode == 0
+        if not _already:
+            _sp.Popen(
+                ["osascript", "-e",
+                 f'tell app "Terminal" to do script "python3 {_dash}"'],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
     except Exception:
         pass
 
@@ -1163,6 +1171,16 @@ def main():
                 bb_pattern_ctx = ""
 
             try:
+                # Fetch live social sentiment + cumulative decision memory
+                _sentiment_ctx = ""
+                try:
+                    _sentiment_ctx = get_sentiment(symbol)
+                    if _sentiment_ctx:
+                        dash_state.update_pipeline("sentiment", "OK")
+                except Exception:
+                    pass
+                _memory_ctx = get_memory_context(symbol=symbol, n=6)
+                dash_state.update_pipeline("debate", "RUNNING")
                 dec = debate_decide(symbol, market, ind, fund, macro,
                                     cash, social_ctx, ins_ctx, earn_s, cfg,
                                     news_ctx=news_ctx, options_ctx=options_ctx,
@@ -1173,7 +1191,9 @@ def main():
                                     rank_ctx=rank_ctx,
                                     poly_ctx=poly_ctx,
                                     strategy_ctx=strategy_ctx,
-                                    lessons_ctx=lessons_ctx)
+                                    lessons_ctx=lessons_ctx,
+                                    memory_ctx=_memory_ctx,
+                                    sentiment_ctx=_sentiment_ctx)
                 print(f"   [{dec.get('consensus','?')} consensus]  "
                       f"Bull: {dec.get('bull_arg','')[:60]}...")
                 print(f"   Bear: {dec.get('bear_arg','')[:60]}...")
@@ -1189,6 +1209,8 @@ def main():
                 dec = llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_pos)
             action, qty, conf, reason = dec["action"], dec["quantity"], dec["confidence"], dec["reason"]
             reasoning = dec["reasoning"]
+            dash_state.update_pipeline("arbiter", "OK")
+            append_decision(symbol, action, conf, reason)
 
             print(f"   Conf {conf}% | {reasoning.get('technical','')[:80]}")
             print(f"   Risks: {reasoning.get('risks','N/A')[:80]}")
@@ -1263,8 +1285,13 @@ def main():
 
                 send_trade_alert(cfg, action, symbol, qty, price, reason, conf,
                                  alpaca_order_id=alpaca_result.get("alpaca_order_id", ""))
+                dash_state.update_pipeline("alpaca", "OK")
                 dash_state.add_trade(action=action, symbol=symbol,
                                      qty=qty, price=price, reason=reason)
+                try:
+                    record_llm_outcome(cfg.get("model", "gpt-4o-mini"), won=(action == "BUY"))
+                except Exception:
+                    pass
 
                 if result and not dry_run:
                     if action == "BUY":

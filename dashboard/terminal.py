@@ -220,6 +220,27 @@ def _lessons_text(s: dict) -> Text:
     return t
 
 
+def _pipeline_panel(s: dict) -> Text:
+    pipe   = s.get("pipeline", {})
+    stages = ["yfinance", "debate", "arbiter", "alpaca"]
+    ICONS  = {"OK": "✓", "RUNNING": "⟳", "ERROR": "✗", "IDLE": "·"}
+    STYS   = {"OK": C_GAIN, "RUNNING": "bold cyan", "ERROR": C_LOSS, "IDLE": C_DIM}
+    t = Text()
+    for i, stage in enumerate(stages):
+        info   = pipe.get(stage, {})
+        status = info.get("status", "IDLE")
+        icon   = ICONS.get(status, "·")
+        sty    = STYS.get(status, C_DIM)
+        ms     = info.get("latency_ms", 0)
+        t.append(f" {icon} ", style=sty)
+        t.append(stage, style="bold white" if status != "IDLE" else C_DIM)
+        if ms:
+            t.append(f"({ms}ms)", style=C_DIM)
+        if i < len(stages) - 1:
+            t.append(" → ", style=C_DIM)
+    return t
+
+
 def _footer(s: dict) -> Text:
     log   = s.get("trade_log", [])
     radar = s.get("radar", {})
@@ -245,6 +266,9 @@ def _footer(s: dict) -> Text:
 
     t.append("  ║ WIN RATE ", style="bold bright_yellow")
     t.append(f"{wr.get('rate','—')}%  ({wr.get('trades','—')} trades)", style=C_VAL)
+    t.append("\n")
+    t.append(" PIPELINE  ", style="bold bright_yellow")
+    t.append_text(_pipeline_panel(s))
     return t
 
 
