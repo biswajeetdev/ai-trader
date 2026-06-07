@@ -80,6 +80,15 @@ def _ell(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _price(v: float) -> str:
+    """Compact price: $60.7K for large values, $187.2 for normal."""
+    if v >= 10_000:
+        return f"${v/1000:.1f}K"
+    if v >= 1_000:
+        return f"${v:.0f}"
+    return f"${v:.2f}"
+
+
 # ── Panel builders ────────────────────────────────────────────────────────────
 
 def _header(s: dict) -> Table:
@@ -157,11 +166,13 @@ def _positions_table(s: dict) -> Table:
     if not rows:
         tbl.add_row("—", "—", "—", "—", "—", "—")
     for p in rows[:12]:
+        qty = p.get("qty", 0)
+        qty_s = f"{qty:.3f}" if isinstance(qty, float) and qty < 1 else str(int(qty)) if isinstance(qty, float) else str(qty)
         tbl.add_row(
             _ell(p.get("symbol", ""), 6),
-            str(p.get("qty", "")),
-            f"${p.get('entry', 0):.1f}",
-            f"${p.get('current', 0):.1f}",
+            _ell(qty_s, 7),
+            _price(p.get('entry', 0)),
+            _price(p.get('current', 0)),
             _pnl_text(p.get("pnl_pct", 0)),
             _ell(p.get("market", ""), 5),
         )
