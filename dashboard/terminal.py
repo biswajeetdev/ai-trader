@@ -153,58 +153,61 @@ def _header(s: dict) -> Table:
 
 
 def _positions_table(s: dict) -> Table:
-    tbl = Table(box=box.SIMPLE_HEAD, header_style=C_LBL, expand=True,
-                show_edge=False, border_style=C_BDR, pad_edge=False)
+    # 5 cols — dropped MKT to fit left panel (~25% width)
+    tbl = Table(box=None, header_style=C_LBL, expand=True,
+                show_edge=False, pad_edge=False, padding=(0, 1))
     tbl.add_column("SYM",   style="bold white", no_wrap=True, overflow="ellipsis", width=6)
-    tbl.add_column("QTY",   justify="right",    no_wrap=True, width=7)
-    tbl.add_column("ENTRY", justify="right",    no_wrap=True, width=7)
-    tbl.add_column("CURR",  justify="right",    no_wrap=True, width=7)
-    tbl.add_column("P&L",   justify="right",    no_wrap=True, width=7)
-    tbl.add_column("MKT",   style=C_DIM,        no_wrap=True, overflow="ellipsis", width=5)
+    tbl.add_column("QTY",   justify="right",    no_wrap=True, width=5)
+    tbl.add_column("ENTRY", justify="right",    no_wrap=True, width=6)
+    tbl.add_column("CURR",  justify="right",    no_wrap=True, width=6)
+    tbl.add_column("P&L",   justify="right",    no_wrap=True, width=6)
 
     rows = s.get("positions", [])
     if not rows:
-        tbl.add_row("—", "—", "—", "—", "—", "—")
-    for p in rows[:12]:
+        tbl.add_row("—", "—", "—", "—", "—")
+    for p in rows[:14]:
         qty = p.get("qty", 0)
-        qty_s = f"{qty:.3f}" if isinstance(qty, float) and qty < 1 else str(int(qty)) if isinstance(qty, float) else str(qty)
+        if isinstance(qty, float):
+            qty_s = f"{qty:.3f}" if qty < 1 else f"{qty:.1f}" if qty < 100 else str(int(qty))
+        else:
+            qty_s = str(qty)
         tbl.add_row(
             _ell(p.get("symbol", ""), 6),
-            _ell(qty_s, 7),
-            _price(p.get('entry', 0)),
-            _price(p.get('current', 0)),
+            _ell(qty_s, 5),
+            _price(p.get("entry", 0)),
+            _price(p.get("current", 0)),
             _pnl_text(p.get("pnl_pct", 0)),
-            _ell(p.get("market", ""), 5),
         )
     return tbl
 
 
-def _signal_feed_table(s: dict, reason_width: int = 35) -> Table:
-    tbl = Table(box=box.SIMPLE_HEAD, header_style=C_LBL, expand=True,
-                show_edge=False, border_style=C_BDR, pad_edge=False)
-    tbl.add_column("TIME",   style=C_DIM,       no_wrap=True, width=8)
+def _signal_feed_table(s: dict) -> Table:
+    # 4-column design: TIME SYM SIGNAL REASON
+    # ACT+CONF merged into SIGNAL, CONS encoded as color → far less column overhead
+    tbl = Table(box=None, header_style=C_LBL, expand=True,
+                show_edge=False, pad_edge=False, padding=(0, 1))
+    tbl.add_column("TIME",   style=C_DIM,       no_wrap=True, width=5)
     tbl.add_column("SYM",    style="bold white", no_wrap=True, width=5)
-    tbl.add_column("ACT",                        no_wrap=True, width=5)
-    tbl.add_column("CF",     justify="right",    no_wrap=True, width=4)
-    tbl.add_column("CONS",                       no_wrap=True, width=7)
-    # REASON: ratio=1 fills remaining space, ellipsis truncates cleanly
-    tbl.add_column("REASON", style=C_DIM, ratio=1, no_wrap=True, overflow="ellipsis")
+    tbl.add_column("SIGNAL",                     no_wrap=True, width=9)
+    tbl.add_column("REASON", style=C_DIM,        no_wrap=True, overflow="ellipsis", ratio=1)
 
-    feed = list(reversed(s.get("signal_feed", [])))[:18]
+    feed = list(reversed(s.get("signal_feed", [])))[:20]
     if not feed:
-        tbl.add_row("—", "—", "—", "—", "—", "waiting for signals…")
+        tbl.add_row("—", "—", "—", "waiting for signals…")
+        return tbl
     for ev in feed:
         action    = ev.get("action", "HOLD")
+        conf      = ev.get("conf", 0)
         consensus = ev.get("consensus", "SPLIT")
-        con_sty   = {"STRONG": C_STRONG, "WEAK": C_WEAK, "SPLIT": C_SPLIT}.get(consensus, C_DIM)
-        tbl.add_row(
-            ev.get("time", ""),
-            _ell(ev.get("symbol", ""), 5),
-            Text(_ell(action, 5), style=_action_style(action)),
-            f"{ev.get('conf', 0)}%",
-            Text(_ell(consensus, 7), style=con_sty),
-            _ell(ev.get("reason", ""), reason_width),
-        )
+        # Encode consensus in signal style: STRONG=bright, WEAK=yellow, SPLIT=dim
+        sig_sty = {"STRONG": C_BUY if action in ("BUY","COVER") else C_SELL if action in ("SELL","SHORT") else C_STRONG,
+                   "WEAK":   C_WEAK,
+                   "SPLIT":  C_DIM}.get(consensus, _action_style(action))
+        signal_t = Text(f"{action[:4]} {conf}%", style=sig_sty)
+        # TIME as HH:MM only (drop seconds)
+        t = ev.get("time", "")
+        t = t[:5] if len(t) >= 5 else t
+        tbl.add_row(t, _ell(ev.get("symbol", ""), 5), signal_t, ev.get("reason", ""))
     return tbl
 
 
@@ -338,8 +341,6 @@ def _build(s: dict) -> Layout:
         )
         right_wide = False
 
-    reason_w = max(20, (w * 44 // 100) - 45)
-
     root["hdr"].update(_header(s))
 
     root["left"].update(
@@ -350,7 +351,7 @@ def _build(s: dict) -> Layout:
 
     if right_wide:
         root["center"].update(
-            Panel(_signal_feed_table(s, reason_w),
+            Panel(_signal_feed_table(s),
                   title="[bold cyan]LIVE SIGNAL FEED[/bold cyan]",
                   border_style=C_BDR, expand=True)
         )
@@ -367,7 +368,7 @@ def _build(s: dict) -> Layout:
     else:
         # Narrow: center gets signal feed only
         root["center"].update(
-            Panel(_signal_feed_table(s, max(20, w * 60 // 100 - 45)),
+            Panel(_signal_feed_table(s),
                   title="[bold cyan]LIVE SIGNAL FEED[/bold cyan]",
                   border_style=C_BDR, expand=True)
         )
