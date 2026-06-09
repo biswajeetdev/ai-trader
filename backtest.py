@@ -418,6 +418,18 @@ def main():
             print("Install quantstats: pip install quantstats")
 
     report = DIR / "backtest_report.json"
+    def _json_safe(obj):
+        if hasattr(obj, "isoformat"):
+            return obj.isoformat()
+        if hasattr(obj, "item"):
+            return obj.item()
+        raise TypeError(type(obj))
+
+    # Convert equity_series Timestamp keys to strings before serializing
+    for r in results:
+        if "equity_series" in r and isinstance(r["equity_series"], dict):
+            r["equity_series"] = {str(k): v for k, v in r["equity_series"].items()}
+
     report.write_text(json.dumps({
         "run_at":    datetime.now().isoformat(),
         "period":    {"start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")},
@@ -426,7 +438,7 @@ def main():
         "results":   results,
         "summary":   {"avg_return": round(avg_ret, 2), "avg_win_rate": round(avg_win, 2),
                       "avg_profit_factor": round(avg_pf, 2), "profitable_assets": profitable},
-    }, indent=2))
+    }, indent=2, default=_json_safe))
     print(f"Report saved → {report}")
 
 
