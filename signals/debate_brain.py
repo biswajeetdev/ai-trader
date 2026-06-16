@@ -239,7 +239,8 @@ def _get_client(cfg):
             models = {m["name"].split(":")[0] for m in r.json().get("models",[])}
             for m in ["qwen2.5:32b","deepseek-r1:14b","llama3.1:8b"]:
                 if m.split(":")[0] in models:
-                    return OpenAI(base_url=OLLAMA_URL, api_key="ollama"), m, f"Ollama/{m}"
+                    return OpenAI(base_url=OLLAMA_URL, api_key="ollama",
+                                  timeout=30.0, max_retries=2), m, f"Ollama/{m}"
     except Exception:
         pass
     try:
@@ -247,7 +248,9 @@ def _get_client(cfg):
         if key:
             # Use fast model for debate (3 calls/asset) — 50 req/min vs 50 req/day for gpt-4o
             fast = cfg.get("_fast_model", "gpt-4o-mini")
-            return OpenAI(base_url="https://models.inference.ai.azure.com",api_key=key), fast, f"GitHub/{fast}"
+            # timeout so throttled GitHub Models calls fail fast instead of hanging indefinitely
+            return OpenAI(base_url="https://models.inference.ai.azure.com", api_key=key,
+                          timeout=30.0, max_retries=2), fast, f"GitHub/{fast}"
     except Exception:
         pass
     ant = os.environ.get("ANTHROPIC_API_KEY") or cfg.get("anthropic_api_key","")
