@@ -243,6 +243,17 @@ def _get_client(cfg):
                                   timeout=30.0, max_retries=2), m, f"Ollama/{m}"
     except Exception:
         pass
+    # FreeLLMAPI local proxy — stacks free-tier providers; avoids the GitHub
+    # Models daily cap. GitHub Models stays as the next fallback below.
+    try:
+        from pathlib import Path as _Path
+        import requests as _rq
+        pkey = _Path("~/freellmapi/.unified-key").expanduser().read_text().strip()
+        _rq.get("http://localhost:3001/api/auth/status", timeout=2)
+        return OpenAI(base_url="http://localhost:3001/v1", api_key=pkey,
+                      timeout=60.0, max_retries=2), "llama-3.3-70b-versatile", "FreeLLMAPI/groq-llama-3.3-70b"
+    except Exception:
+        pass
     try:
         key = os.environ.get("GITHUB_TOKEN") or subprocess.check_output(["gh","auth","token"],text=True).strip()
         if key:

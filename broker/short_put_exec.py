@@ -43,6 +43,18 @@ def execute_short_put(cfg: dict, opp: dict, dry_run: bool = False) -> dict:
     if not c:
         return {"error": "Alpaca not configured"}
 
+    # Buying-power guard: a cash-secured put locks strike*100 as collateral.
+    # Skip cleanly when the account can't cover it instead of letting Alpaca
+    # reject the order with a 403 (which spammed errors every run).
+    collateral = strike * 100
+    try:
+        avail = float(c.get_account().options_buying_power)
+    except Exception:
+        avail = None
+    if avail is not None and collateral > avail:
+        return {"skipped": True, "symbol": symbol, "strike": strike,
+                "reason": f"insufficient buying power — need ${collateral:,.0f}, have ${avail:,.0f}"}
+
     try:
         contracts = c.get_option_contracts(GetOptionContractsRequest(
             underlying_symbols=[symbol],

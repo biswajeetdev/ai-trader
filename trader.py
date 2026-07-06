@@ -30,8 +30,6 @@ from signals.options_flow      import get_options_signals,        format_for_llm
 from signals.whale_tracker     import get_whale_signals,          format_for_llm as whale_fmt
 from signals.fear_greed        import get_fear_greed_signals,     format_for_llm as fg_fmt, get_summary as fg_summary
 from signals.india_signals     import get_nse_bulk_deals, get_india_vix, get_nse_options_flow, format_bulk_deals_for_llm
-from broker.approval_queue    import queue_trade, update_message_id
-from broker.telegram_notifier import send_approval_request
 from broker.ai4trade   import auth, get_profile, execute_trade, get_positions_api, refresh_token
 from rag.pattern_memory import get_rag_context
 from broker.alpaca_exec import execute_alpaca_trade, get_alpaca_portfolio, export_alpaca_to_excel
@@ -42,7 +40,7 @@ from signals.india_short_put_screener import (
     find_india_short_put_opportunity, check_india_exits,
     load_positions as india_sp_load_positions,
 )
-from broker.zerodha_exec import execute_india_short_put, close_india_short_put
+from broker.zerodha_exec import execute_india_short_put, close_india_short_put, execute_india_trade
 from signals.stock_ranker import rank_watchlist, get_rank_context
 from broker.risk        import (
     check_drawdown_circuit, check_stops, load_positions, save_positions,
@@ -50,6 +48,7 @@ from broker.risk        import (
     dynamic_position_size, get_equity_history, get_correlated_symbols,
     mark_partial_done,
     STOP_LOSS_ATR, PROFIT_TARGET_ATR, MIN_CONFIDENCE, MAX_TRADE_USD,
+    DRAWDOWN_HALT_PCT,
 )
 from signals.mean_reversion      import rsi_reversion_signal, get_pairs_signals
 from signals.screener            import get_screener_candidates
@@ -68,10 +67,7 @@ from broker.wheel_tracker        import get_assignable_symbols, update_wheel_sta
 from rag.strategy_evolver        import (
     record_strategy_outcome, get_strategy_allocation_prompt,
     get_recent_lessons, bootstrap_from_trade_history,
-    record_llm_outcome, get_best_llm,
 )
-from rag.trading_memory  import append_decision, get_memory_context, update_outcome
-from signals.sentiment_fetch import get_sentiment
 import dashboard.state as dash_state
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -120,8 +116,17 @@ def gh_token():
         return None
 
 
+def _freellmapi_key():
+    """Unified key for the local FreeLLMAPI proxy (free-tier pool). Read from a file
+    (launchd strips env) outside the repo; returns None if the proxy isn't set up."""
+    try:
+        return Path("~/freellmapi/.unified-key").expanduser().read_text().strip()
+    except Exception:
+        return None
+
+
 def detect_llm_backend():
-    """Priority: Ollama local (pendrive) → GitHub Models → Anthropic. Result cached per process."""
+    """Priority: Ollama local → FreeLLMAPI proxy → GitHub Models. Result cached per process."""
     global _LLM_BACKEND
     if _LLM_BACKEND is not None:
         return _LLM_BACKEND
@@ -137,7 +142,19 @@ def detect_llm_backend():
     except Exception:
         pass
 
-    # 2. GitHub Models
+    # 2. FreeLLMAPI local proxy — stacks free-tier providers; avoids the GitHub
+    #    Models daily cap. GitHub Models stays as the next fallback below.
+    pkey = _freellmapi_key()
+    if pkey:
+        try:
+            requests.get("http://localhost:3001/api/auth/status", timeout=2)
+            _LLM_BACKEND = (OpenAI(base_url="http://localhost:3001/v1", api_key=pkey),
+                            "llama-3.3-70b-versatile", "FreeLLMAPI/groq-llama-3.3-70b")
+            return _LLM_BACKEND
+        except Exception:
+            pass
+
+    # 3. GitHub Models
     key = os.environ.get("GITHUB_TOKEN") or gh_token()
     if key:
         _LLM_BACKEND = (OpenAI(base_url="https://models.inference.ai.azure.com", api_key=key),
@@ -649,6 +666,7 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
     # ── Screen for new entries ────────────────────────────────────────────────
     vix = macro.get("vix")
     us_stocks = [item for item in watchlist if item.get("market") == "us-stock"]
+    candidates = []   # collected during screening, then executed cheapest-first
 
     for item in us_stocks:
         symbol = item["symbol"]
@@ -689,18 +707,33 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
             print(f"   [SP] {symbol}{rank_tag} ${opp['strike']}P exp {opp['expiry']} "
                   f"({opp['dte']}DTE, {opp['otm_pct']}% OTM) "
                   f"bid ${opp['premium']} → credit ${opp['credit']}")
-
-            result = execute_short_put(cfg, opp, dry_run)
-            if "error" in result:
-                print(f"        ✗ {result['error']}")
-            else:
-                tag = "[DRY]" if dry_run else f"[{result.get('status','')}]"
-                print(f"        ✓ {tag} order {str(result.get('alpaca_order_id',''))[:8]}")
-                trades.append({"action": "SHORT_PUT", "symbol": symbol,
-                               "strike": opp["strike"], "expiry": opp["expiry"],
-                               "premium": opp["premium"], "credit": opp["credit"]})
+            candidates.append((symbol, opp))
         except Exception as e:
             print(f"   [SP] {symbol} skipped: {e}")
+
+    # ── Execute cheapest-collateral-first under a concurrent cap ───────────────
+    # Cheaper underlyings (smaller strike*100 collateral) fill first so the
+    # account opens the most CSPs it can afford; the buying-power guard in
+    # execute_short_put then skips any that don't fit. sp_max_concurrent is a
+    # soft risk cap (override in config.json).
+    max_concurrent = cfg.get("sp_max_concurrent", 8)
+    open_count = len(sp_load_positions())
+    for symbol, opp in sorted(candidates, key=lambda x: x[1]["strike"]):
+        if open_count >= max_concurrent:
+            print(f"   [SP] {symbol} skipped — concurrent CSP cap reached ({max_concurrent})")
+            continue
+        result = execute_short_put(cfg, opp, dry_run)
+        if result.get("skipped"):
+            print(f"        ⊘ {symbol} skipped — {result['reason']}")
+        elif "error" in result:
+            print(f"        ✗ {result['error']}")
+        else:
+            tag = "[DRY]" if dry_run else f"[{result.get('status','')}]"
+            print(f"        ✓ {tag} order {str(result.get('alpaca_order_id',''))[:8]}")
+            open_count += 1
+            trades.append({"action": "SHORT_PUT", "symbol": symbol,
+                           "strike": opp["strike"], "expiry": opp["expiry"],
+                           "premium": opp["premium"], "credit": opp["credit"]})
 
     return trades
 
@@ -798,11 +831,13 @@ def main():
     print(f"  Market : {'OPEN' if is_market_open() else 'CLOSED'}")
     print(f"{'='*62}\n")
 
-    # Launch Bloomberg terminal only if not already running
+    # Launch Bloomberg terminal in a new Terminal.app window
     dash_state.set_status("RUNNING")
     try:
         import subprocess as _sp
         _dash = Path(__file__).parent / "dashboard" / "terminal.py"
+        # Only open a dashboard window if one isn't already running — otherwise
+        # every 30-min cron run would spawn another Terminal window.
         _already = _sp.run(
             ["pgrep", "-f", "dashboard/terminal.py"],
             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
@@ -830,7 +865,8 @@ def main():
     profile = get_profile(token)
     cash    = float(profile.get("cash", 100_000))
     print(f"Account : {profile.get('name')}  |  Cash: ${cash:,.2f}\n")
-    dash_state.update_account(equity=float(profile.get('portfolio_value', cash)), cash=cash)
+    dash_state.update_account(equity=float(profile.get("portfolio_value", cash)),
+                               cash=cash)
 
     # ── Drawdown circuit breaker (persists across runs via portfolio_hwm.json) ─
     dd_halted, port_value, dd_pct, peak = check_drawdown_circuit(token, cash)
@@ -863,7 +899,7 @@ def main():
     dash_state.update_macro(
         vix=float(macro.get("vix") or 0),
         spy_5d=float(macro.get("spy_5d_pct") or 0),
-        fg_score=int(macro.get("fear_greed", 0) or 0),
+        fg_score=int(macro.get("fear_greed", 0)),
         bot_score=cfg.get("_bot_score", {}).get("score", 50),
         regime=cfg.get("_bot_score", {}).get("regime", ""),
     )
@@ -992,6 +1028,7 @@ def main():
         win_rate_summary = _base_summary
 
     # ── Strategy self-evolution (bandit scores + post-mortem lessons) ─────────
+    # ── Strategy self-evolution context (bandit + post-mortem lessons) ────────
     try:
         strategy_ctx = get_strategy_allocation_prompt()
         lessons_ctx  = get_recent_lessons(5)
@@ -999,7 +1036,7 @@ def main():
         strategy_ctx = ""
         lessons_ctx  = ""
 
-    # Push strategy/lesson state to dashboard
+    # Push to dashboard
     try:
         from rag.strategy_evolver import _load as _se_load
         _se_data = _se_load()
@@ -1171,16 +1208,6 @@ def main():
                 bb_pattern_ctx = ""
 
             try:
-                # Fetch live social sentiment + cumulative decision memory
-                _sentiment_ctx = ""
-                try:
-                    _sentiment_ctx = get_sentiment(symbol)
-                    if _sentiment_ctx:
-                        dash_state.update_pipeline("sentiment", "OK")
-                except Exception:
-                    pass
-                _memory_ctx = get_memory_context(symbol=symbol, n=6)
-                dash_state.update_pipeline("debate", "RUNNING")
                 dec = debate_decide(symbol, market, ind, fund, macro,
                                     cash, social_ctx, ins_ctx, earn_s, cfg,
                                     news_ctx=news_ctx, options_ctx=options_ctx,
@@ -1191,9 +1218,7 @@ def main():
                                     rank_ctx=rank_ctx,
                                     poly_ctx=poly_ctx,
                                     strategy_ctx=strategy_ctx,
-                                    lessons_ctx=lessons_ctx,
-                                    memory_ctx=_memory_ctx,
-                                    sentiment_ctx=_sentiment_ctx)
+                                    lessons_ctx=lessons_ctx)
                 print(f"   [{dec.get('consensus','?')} consensus]  "
                       f"Bull: {dec.get('bull_arg','')[:60]}...")
                 print(f"   Bear: {dec.get('bear_arg','')[:60]}...")
@@ -1209,8 +1234,6 @@ def main():
                 dec = llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_pos)
             action, qty, conf, reason = dec["action"], dec["quantity"], dec["confidence"], dec["reason"]
             reasoning = dec["reasoning"]
-            dash_state.update_pipeline("arbiter", "OK")
-            append_decision(symbol, action, conf, reason)
 
             print(f"   Conf {conf}% | {reasoning.get('technical','')[:80]}")
             print(f"   Risks: {reasoning.get('risks','N/A')[:80]}")
@@ -1261,17 +1284,11 @@ def main():
                 val = qty * price
                 print(f"   qty={qty}  value=${val:,.0f}  — {reason}")
 
-                # Execute on ai4trade.ai (paper) — Indian market queued for approval
+                # Execute Indian market trades via Zerodha (paper now, live when zerodha_live=true)
                 if market == "in-stock":
-                    trade_id = queue_trade(cfg, symbol, market, action, qty,
-                                           price, conf, reason, ind.get("atr14", 0))
-                    msg_id = send_approval_request(cfg, trade_id, action, symbol,
-                                                    qty, price, conf, reason)
-                    if msg_id:
-                        update_message_id(trade_id, msg_id)
-                    print(f"   → queued for Telegram approval (trade_id={trade_id})")
-                    result       = {"queued": True, "trade_id": trade_id}
-                    alpaca_result = {"skipped": "awaiting approval"}
+                    result = execute_india_trade(cfg, symbol, action, qty, reason,
+                                                 price, ind.get("atr14", 0), dry_run)
+                    alpaca_result = {"skipped": "zerodha"}
                 else:
                     result = execute_trade(token, symbol, market, action, qty, reason, dry_run)
                     # Mirror to Alpaca — BUY stocks get native bracket (stop + target)
@@ -1285,13 +1302,8 @@ def main():
 
                 send_trade_alert(cfg, action, symbol, qty, price, reason, conf,
                                  alpaca_order_id=alpaca_result.get("alpaca_order_id", ""))
-                dash_state.update_pipeline("alpaca", "OK")
                 dash_state.add_trade(action=action, symbol=symbol,
                                      qty=qty, price=price, reason=reason)
-                try:
-                    record_llm_outcome(cfg.get("model", "gpt-4o-mini"), won=(action == "BUY"))
-                except Exception:
-                    pass
 
                 if result and not dry_run:
                     if action == "BUY":
@@ -1420,17 +1432,17 @@ def main():
     sp_open = len(sp_load_positions()) + len(india_sp_load_positions())
     send_run_status(cfg, cash, trades_today, len(load_positions()), sp_open)
 
-    # Final dashboard state update
-    dash_state.set_status("IDLE")
-    dash_state.set_current_symbol("")
-    dash_state.update_positions(list(load_positions().values()))
-
     # Daily summary email at market close
     if is_near_close() and not dry_run:
         print("Near market close — sending daily summary...")
         send_daily_summary(cfg, cash, trades_today, len(load_positions()))
         _, port_val, dd_pct, _ = check_drawdown_circuit(token, cash)
         tg_daily_summary(cfg, trades_today, cash, port_val, dd_pct * 100)
+
+    # Final dashboard state update
+    dash_state.set_status("IDLE")
+    dash_state.set_current_symbol("")
+    dash_state.update_positions(list(load_positions().values()))
 
 
 if __name__ == "__main__":

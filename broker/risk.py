@@ -150,18 +150,25 @@ def save_hwm(hwm: dict) -> None:
     HWM_FILE.write_text(json.dumps(hwm, indent=2))
 
 
-def _portfolio_value(token: str, cash: float) -> float:
-    """Cash + mark-to-market of open positions from ai4trade.ai."""
+def _portfolio_value(token: str, cash: float) -> tuple[float, bool]:
+    """Cash + mark-to-market of open positions from ai4trade.ai.
+
+    Returns (value, ok). ok=False means the position fetch FAILED and the
+    returned value is cash-only and UNRELIABLE — callers must not treat it as
+    true equity (a failed fetch must never drive the drawdown circuit breaker).
+    A successful-but-empty response (genuinely all cash) returns ok=True.
+    """
     try:
-        data      = get_positions_api(token)
-        positions = data.get("positions", [])
-        holdings  = sum(
+        data = get_positions_api(token)
+        if not isinstance(data, dict) or "positions" not in data:
+            return cash, False    # malformed / soft-failure response
+        holdings = sum(
             float(p.get("quantity", 0)) * float(p.get("current_price") or p.get("price", 0))
-            for p in positions
+            for p in data["positions"]
         )
-        return cash + holdings
+        return cash + holdings, True
     except Exception:
-        return cash   # conservative fallback
+        return cash, False        # hard failure (network / HTTP / timeout)
 
 
 def check_drawdown_circuit(token: str, cash: float) -> tuple[bool, float, float, float]:
@@ -170,9 +177,22 @@ def check_drawdown_circuit(token: str, cash: float) -> tuple[bool, float, float,
     Persists state across launchd runs via portfolio_hwm.json.
 
     Returns: (halted, current_value, drawdown_pct, peak)
+
+    If position data is unavailable (broker API down), the check is SKIPPED:
+    prior halt state is preserved and peak/equity_history are left untouched,
+    so a transient outage can never newly trip or clear the breaker — nor
+    corrupt the equity curve — on an unreliable cash-only reading.
     """
     hwm     = load_hwm()
-    current = _portfolio_value(token, cash)
+    current, ok = _portfolio_value(token, cash)
+
+    if not ok:
+        eq_hist    = hwm.get("equity_history", [])
+        peak       = hwm.get("peak", 0.0)
+        last_known = eq_hist[-1] if eq_hist else (peak or current)
+        dd         = (last_known - peak) / peak if peak > 0 else 0.0
+        # Do NOT update peak or equity_history on unreliable data.
+        return hwm.get("halted", False), last_known, dd, peak
 
     if current > hwm["peak"]:
         hwm["peak"] = current

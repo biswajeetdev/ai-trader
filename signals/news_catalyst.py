@@ -44,6 +44,23 @@ BULLISH_KW = {
     "dividend increase": (0.45, "DIVIDEND"),
     "stock split":       (0.35, "CORPORATE"),
     "investment":        (0.30, "DEAL"),
+    # ── AI / contract catalysts (the "got an AI contract → spiked" class) ──
+    # NOTE: a bullish hit here is annotated with chase-risk downstream so the
+    # brain treats an already-spiked name as priced-in, not a fresh long.
+    "ai contract":       (0.70, "AI_CONTRACT"),
+    "ai partnership":    (0.60, "AI_CONTRACT"),
+    "ai deal":           (0.60, "AI_CONTRACT"),
+    "ai infrastructure": (0.55, "AI_CONTRACT"),
+    "data center deal":  (0.55, "AI_CONTRACT"),
+    "chip order":        (0.55, "AI_CONTRACT"),
+    "awarded contract":  (0.65, "CONTRACT_WIN"),
+    "wins contract":     (0.65, "CONTRACT_WIN"),
+    "secures contract":  (0.65, "CONTRACT_WIN"),
+    "government contract":(0.60, "CONTRACT_WIN"),
+    "defense contract":  (0.60, "CONTRACT_WIN"),
+    "multi-year deal":   (0.55, "CONTRACT_WIN"),
+    "supply agreement":  (0.50, "CONTRACT_WIN"),
+    "selected by":       (0.45, "CONTRACT_WIN"),
 }
 BEARISH_KW = {
     "miss estimates":    (-0.75, "EARNINGS_MISS"),
@@ -100,6 +117,50 @@ def _score_text(text):
             best_type  = etype
             best_kw    = kw
     return round(best_score, 2), best_type, best_kw
+
+
+# ── Anti-chasing guard ────────────────────────────────────────────────────────
+# A catalyst the market has already absorbed is not an opportunity — buying a
+# name that's already up 300% makes you the exit liquidity. We only treat a
+# bullish catalyst as actionable if the move hasn't already happened.
+CHASE_WINDOW_PCT = 15.0   # already up >15% over the last week → likely priced in
+CHASE_GAP_PCT    = 8.0    # or gapped >8% in the latest session → chasing
+
+def _recent_move_pct(symbol, days=5):
+    """How far a name has already run. Returns (pct_over_window, latest_gap_pct)
+    or (None, None) if price data is unavailable."""
+    try:
+        tk   = f"{symbol}-USD" if symbol in ("BTC", "ETH") else symbol
+        hist = yf.Ticker(tk).history(period=f"{days + 2}d")
+        closes = hist["Close"].dropna().tolist()
+        if len(closes) < 2:
+            return None, None
+        pct_window = (closes[-1] - closes[0])  / closes[0]  * 100
+        gap_latest = (closes[-1] - closes[-2]) / closes[-2] * 100
+        return round(pct_window, 1), round(gap_latest, 1)
+    except Exception:
+        return None, None
+
+
+def _annotate_chase_risk(signal):
+    """Tag a bullish catalyst with chase-risk so the LLM never initiates a long
+    on a name that has already made its move. Additive — never drops the signal."""
+    signal.setdefault("chase_risk", False)
+    signal.setdefault("already_moved_pct", None)
+    signal.setdefault("actionable", True)
+    if signal["direction"] != "BULLISH" or signal["sentiment"] < 0.5:
+        return signal
+    tickers = signal.get("tickers", [])
+    if len(tickers) != 1:        # ambiguous subject — skip the price check
+        return signal
+    mv_window, gap = _recent_move_pct(tickers[0])
+    if mv_window is None:
+        return signal
+    signal["already_moved_pct"] = mv_window
+    if mv_window >= CHASE_WINDOW_PCT or (gap is not None and gap >= CHASE_GAP_PCT):
+        signal["chase_risk"] = True
+        signal["actionable"] = False
+    return signal
 
 
 def _extract_tickers(text, base_tickers):
@@ -296,6 +357,10 @@ def get_news_signals(watchlist_tickers=None, use_cache=True):
                     key=lambda x: (x["urgency"] == "HIGH", abs(x["sentiment"])),
                     reverse=True)
 
+    # Flag bullish catalysts the market has already priced in (anti-chasing).
+    for s in unique:
+        _annotate_chase_risk(s)
+
     cache["news_signals"] = unique
     _save_cache(cache)
     return unique
@@ -308,10 +373,17 @@ def format_for_llm(signals, symbol):
         return "No material news or corporate events in last 8–12h."
     lines = []
     for s in relevant[:4]:
+        note = ""
+        moved = s.get("already_moved_pct")
+        if s.get("chase_risk"):
+            note = (f"  ⚠ CHASE RISK: already {moved:+.1f}% over ~1wk — catalyst "
+                    f"likely priced in; do NOT open a new long on this alone.")
+        elif moved is not None:
+            note = f"  (only {moved:+.1f}% over ~1wk — catalyst may still be early)"
         lines.append(
             f"[{s['urgency']}] {s['event_type']} via {s['source']} → "
             f"{s['direction']} (score {s['sentiment']:+.2f}): "
-            f"\"{s['headline'][:130]}\" ({s['pub']})"
+            f"\"{s['headline'][:130]}\" ({s['pub']}){note}"
         )
     return "\n".join(lines)
 
