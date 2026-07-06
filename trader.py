@@ -75,12 +75,32 @@ DIR    = Path(__file__).parent
 CONFIG = DIR / "config.json"
 LOG    = DIR / "log.json"
 EXCEL  = DIR / "holdings.xlsx"
+EQUITY_CSV = DIR / "equity_curve.csv"   # NAV time series for report_perf.py (gitignored)
 # POSITIONS, TRADE_HIST, HWM_FILE, TOKEN_FILE → broker.risk / broker.ai4trade
 
 # ── constants ─────────────────────────────────────────────────────────────────
 LOG_MAX                = 500
 EARNINGS_BLACKOUT_DAYS = 5
 # STOP_LOSS_ATR, PROFIT_TARGET_ATR, MIN_CONFIDENCE, MAX_TRADE_USD live in broker.risk
+
+# ── Equity-curve logger ───────────────────────────────────────────────────────
+def log_equity(equity: float, cash: float) -> None:
+    """Append one NAV point (timestamp, equity, cash, holdings) to equity_curve.csv.
+
+    This is the time series report_perf.py turns into Sharpe/drawdown/win-rate.
+    Best-effort: never let logging break a trading run.
+    """
+    try:
+        holdings   = round(float(equity) - float(cash), 2)
+        row        = f"{datetime.now().isoformat(timespec='seconds')},{round(float(equity),2)},{round(float(cash),2)},{holdings}\n"
+        write_hdr  = not EQUITY_CSV.exists()
+        with open(EQUITY_CSV, "a") as f:
+            if write_hdr:
+                f.write("timestamp,total_equity,cash,holdings\n")
+            f.write(row)
+    except Exception:
+        pass
+
 
 # ── Entry timing gate ─────────────────────────────────────────────────────────
 def _is_good_entry_window() -> bool:
@@ -865,8 +885,9 @@ def main():
     profile = get_profile(token)
     cash    = float(profile.get("cash", 100_000))
     print(f"Account : {profile.get('name')}  |  Cash: ${cash:,.2f}\n")
-    dash_state.update_account(equity=float(profile.get("portfolio_value", cash)),
-                               cash=cash)
+    total_equity = float(profile.get("portfolio_value", cash))
+    dash_state.update_account(equity=total_equity, cash=cash)
+    log_equity(total_equity, cash)     # append NAV point for report_perf.py
 
     # ── Drawdown circuit breaker (persists across runs via portfolio_hwm.json) ─
     dd_halted, port_value, dd_pct, peak = check_drawdown_circuit(token, cash)

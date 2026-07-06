@@ -27,6 +27,20 @@ def _client(cfg: dict):
     return TradingClient(k, s, paper=cfg.get("alpaca_paper", True))
 
 
+def round_to_tick(px: float) -> float:
+    """Round an option price to a valid exchange tick.
+
+    OCC/Alpaca rule: $0.01 ticks below $3.00, $0.05 ticks at/above $3.00.
+    A live-quoted premium (e.g. 2.8734) otherwise gets rejected with
+    code 42210000 "limit price must be limited to 2 decimal places".
+    Always returns <=2 decimals, so submitted limits are never rejected.
+    """
+    if px is None:
+        return px
+    tick = 0.01 if px < 3.0 else 0.05
+    return round(round(px / tick) * tick, 2)
+
+
 def execute_short_put(cfg: dict, opp: dict, dry_run: bool = False) -> dict:
     """Sell-to-open one put contract at the bid. Returns result dict."""
     symbol  = opp["symbol"]
@@ -71,7 +85,7 @@ def execute_short_put(cfg: dict, opp: dict, dry_run: bool = False) -> dict:
         occ   = items[0].symbol
         order = c.submit_order(LimitOrderRequest(
             symbol=occ, qty=1, side=OrderSide.SELL,
-            type="limit", limit_price=premium,
+            type="limit", limit_price=round_to_tick(premium),
             time_in_force=TimeInForce.DAY,
         ))
 
@@ -123,7 +137,7 @@ def close_short_put(cfg: dict, pos: dict, current_premium: float,
         occ   = pos.get("occ_symbol", "")
         order = c.submit_order(LimitOrderRequest(
             symbol=occ, qty=qty, side=OrderSide.BUY,
-            type="limit", limit_price=current_premium,
+            type="limit", limit_price=round_to_tick(current_premium),
             time_in_force=TimeInForce.DAY,
         ))
 

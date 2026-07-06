@@ -18,6 +18,8 @@ import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from data.history import get_daily   # resilient OHLCV: cache -> yfinance -> Alpaca
+
 warnings.filterwarnings("ignore")
 DIR = Path(__file__).parent
 COMMISSION = 0.0005   # 0.05% per side
@@ -172,8 +174,7 @@ def signal(row, p, market):
 
 def run_asset(symbol, market, start, end, capital, params):
     ticker = f"{symbol}-USD" if market == "crypto" else symbol
-    df     = yf.download(ticker, start=start, end=end,
-                         interval="1d", progress=False, auto_adjust=True)
+    df     = get_daily(ticker, start, end)
     if df.empty or len(df) < 80:
         return None
 

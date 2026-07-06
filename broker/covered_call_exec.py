@@ -15,6 +15,8 @@ try:
 except ImportError:
     ALPACA_OPTIONS = False
 
+from broker.short_put_exec import round_to_tick
+
 POSITIONS_FILE = Path(__file__).parent / "covered_call_positions.json"
 OTM_MIN_PCT, OTM_MAX_PCT = 4, 6
 MIN_DTE, MAX_DTE         = 26, 35
@@ -100,7 +102,7 @@ def execute_covered_call(cfg: dict, opp: dict, dry_run: bool = False) -> dict:
         occ   = items[0].symbol
         order = c.submit_order(LimitOrderRequest(
             symbol=occ, qty=1, side=OrderSide.SELL,
-            type="limit", limit_price=premium, time_in_force=TimeInForce.DAY,
+            type="limit", limit_price=round_to_tick(premium), time_in_force=TimeInForce.DAY,
         ))
         result = {"alpaca_order_id": str(order.id), "occ_symbol": occ, "symbol": symbol,
                   "strike": strike, "expiry": expiry, "premium": premium,
@@ -130,7 +132,7 @@ def close_covered_call(cfg: dict, pos: dict, current_premium: float,
         occ   = pos.get("occ_symbol", "")
         order = c.submit_order(LimitOrderRequest(
             symbol=occ, qty=qty, side=OrderSide.BUY,
-            type="limit", limit_price=current_premium, time_in_force=TimeInForce.DAY,
+            type="limit", limit_price=round_to_tick(current_premium), time_in_force=TimeInForce.DAY,
         ))
         positions = load_positions()
         positions.pop(pos["symbol"], None)
