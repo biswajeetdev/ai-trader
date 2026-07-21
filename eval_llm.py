@@ -22,12 +22,19 @@ LOOK-AHEAD BIAS — READ THIS
   "Profit Mirage" and 2601.13770 "Look-Ahead-Bench"). Mitigations here:
     * --anonymize masks the ticker so the model can't identify the asset.
     * Prefer as-of dates AFTER the model's training cutoff for a clean read.
-  Only point-in-time PRICE/TECHNICAL context is fed; live-only alt-data
-  (social, Congress, options flow, VIX, fundamentals) is NOT reconstructed and
-  is passed empty — so this isolates the brain's edge on technicals alone.
+  CATALYST CONTEXT (point-in-time, on by default; --no-catalysts to disable)
+  SEC EDGAR filings ARE dated, so three of the brain's top-weighted catalysts
+  are reconstructed leak-free by pinning the filing-date window to <= as-of:
+    * 8-K   material events (news/M&A)   via news_catalyst._edgar_8k
+    * 13D/G/13F institutional/activist   via whale_tracker._search_edgar_filings
+    * Form 4 insider transactions        via EDGAR full-text search
+  Options flow has NO free point-in-time history and stays EXCLUDED (a hard
+  ceiling on this eval). Because catalysts name the real entity, they are
+  INCOMPATIBLE with --anonymize (which would then leak the ticker); requesting
+  both disables catalysts. VIX/fundamentals/social remain passed empty.
 
 Usage:
-  python3 eval_llm.py --symbols NVDA,AAPL --dates 8 --horizon 20 [--anonymize] [--years 2]
+  python3 eval_llm.py --symbols NVDA,AAPL --dates 8 --horizon 20 [--anonymize] [--no-catalysts] [--years 2]
 """
 
 import sys, os, json, argparse, warnings, subprocess
@@ -42,6 +49,81 @@ DIR = Path(__file__).parent
 from backtest import compute_all                      # point-in-time indicators (rolling = backward-only)
 from data.history import get_daily                     # resilient OHLCV: cache -> yfinance -> Alpaca
 from signals.debate_brain import debate_decide
+from signals.news_catalyst import _edgar_8k          # date-pinnable (as_of=) — 8-K events
+from signals.whale_tracker import _search_edgar_filings  # date-pinnable (as_of=) — 13D/G/F
+
+import time
+import requests
+
+EDGAR_FTS = "https://efts.sec.gov/LATEST/search-index"
+EDGAR_UA  = {"User-Agent": "ai-trader research@example.com"}
+
+
+def _edgar_form4(symbol, as_of, lookback_days=30):
+    """Point-in-time Form 4 (insider) filings via EDGAR full-text search.
+    Returns [{entity, filed}] with filing date <= as_of (leak-safe)."""
+    try:
+        end_dt = datetime.strptime(as_of, "%Y-%m-%d")
+        start  = (end_dt - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        resp = requests.get(EDGAR_FTS, headers=EDGAR_UA, timeout=10,
+                            params={"q": f'"{symbol}"', "forms": "4",
+                                    "dateRange": "custom", "startdt": start, "enddt": as_of})
+        if not resp.ok:
+            return []
+        out = []
+        for h in resp.json().get("hits", {}).get("hits", [])[:5]:
+            src = h.get("_source", {})
+            filed = src.get("file_date", "")
+            if filed and filed > as_of:            # defensive: never future
+                continue
+            names = src.get("display_names") or ["?"]
+            ent = names[0] if isinstance(names, list) and names else "?"
+            out.append({"entity": str(ent)[:60], "filed": filed})
+        return out
+    except Exception:
+        return []
+
+
+def pit_catalysts(symbol, as_of, market):
+    """Reconstruct point-in-time catalyst context for an as-of date using ONLY
+    SEC EDGAR filings dated <= as_of. Returns (news_ctx, whale_ctx, insider_ctx,
+    sources:set). Options flow is not reconstructable and is left empty."""
+    if market != "us-stock":                       # EDGAR is US equities only
+        return "", "", "", set()
+    sources = set()
+
+    # 8-K material events (news / M&A / exec change) in the prior 14 days
+    news = [s for s in _edgar_8k(symbol, lookback_days=14, as_of=as_of)
+            if not s.get("pub") or s["pub"] <= as_of]
+    news_ctx = ""
+    if news:
+        sources.add("8-K")
+        news_ctx = "SEC 8-K material events (<=14d): " + "; ".join(
+            s["headline"] for s in news[:3])
+    time.sleep(0.3)                                # EDGAR politeness (~10 req/s cap)
+
+    # 13D/G activist + 13F institutional in the prior 90 days (activist first)
+    wf = [f for f in _search_edgar_filings(symbol, days_back=90, as_of=as_of)
+          if not f.get("filed") or f["filed"] <= as_of]
+    whale_ctx = ""
+    if wf:
+        sources.add("13D/F")
+        act  = [f for f in wf if "13D" in f["form"] or "13G" in f["form"]]
+        show = (act or wf)[:3]
+        whale_ctx = "SEC institutional filings (<=90d): " + "; ".join(
+            f"{f['form']} {f['entity']} ({f['filed']})" for f in show)
+    time.sleep(0.3)
+
+    # Form 4 insider transactions in the prior 30 days
+    f4 = _edgar_form4(symbol, as_of, lookback_days=30)
+    insider_ctx = ""
+    if f4:
+        sources.add("Form4")
+        insider_ctx = "SEC Form 4 insider (<=30d): " + "; ".join(
+            f"{x['entity']} ({x['filed']})" for x in f4[:3])
+    time.sleep(0.3)
+
+    return news_ctx, whale_ctx, insider_ctx, sources
 
 
 def load_cfg() -> dict:
@@ -83,7 +165,8 @@ def build_ind(ind_df: pd.DataFrame, i: int) -> dict:
 
 
 def eval_symbol(symbol: str, market: str, n_dates: int, horizon: int,
-                years: int, anonymize: bool, cfg: dict) -> list:
+                years: int, anonymize: bool, cfg: dict,
+                use_catalysts: bool = True) -> list:
     ticker = f"{symbol}-USD" if market == "crypto" else symbol
     end = datetime.today() + timedelta(days=1)
     df  = get_daily(ticker, (end - timedelta(days=365 * years + 1)).strftime("%Y-%m-%d"),
@@ -107,20 +190,31 @@ def eval_symbol(symbol: str, market: str, n_dates: int, horizon: int,
     mkt   = market
 
     for i in idxs:
-        ind = build_ind(ind_df, i)
+        ind   = build_ind(ind_df, i)
+        as_of = str(dates[i].date())
+        news_ctx = whale_ctx = insider_ctx = ""
+        cat_sources = set()
+        if use_catalysts:                          # point-in-time EDGAR (real ticker)
+            news_ctx, whale_ctx, insider_ctx, cat_sources = pit_catalysts(
+                symbol, as_of, market)
         try:
-            dec = debate_decide(label, mkt, ind, {}, {}, 100_000, "", "", "", cfg)
+            dec = debate_decide(label, mkt, ind, {}, {}, 100_000,
+                                "", insider_ctx, "", cfg,
+                                news_ctx=news_ctx, whale_ctx=whale_ctx)
         except Exception as e:
-            print(f"  {symbol} @{dates[i].date()}: brain error: {e}")
+            print(f"  {symbol} @{as_of}: brain error: {e}")
             continue
-        fwd = float(ind_df["close"].iloc[i + horizon] / ind_df["close"].iloc[i] - 1) * 100
+        fwd   = float(ind_df["close"].iloc[i + horizon] / ind_df["close"].iloc[i] - 1) * 100
+        gated = dec.get("consensus") == "SKIP"
         rows.append({
-            "symbol": symbol, "date": str(dates[i].date()),
+            "symbol": symbol, "date": as_of,
             "action": dec.get("action", "HOLD"), "conf": dec.get("confidence", 0),
             "fwd_ret": round(fwd, 2),
+            "catalysts": sorted(cat_sources), "gated": gated,
         })
-        print(f"  {symbol} @{dates[i].date()}  {rows[-1]['action']:5} "
-              f"conf={rows[-1]['conf']:>3}%   fwd{horizon}d={fwd:+6.2f}%")
+        cat_tag = ("[" + ",".join(sorted(cat_sources)) + "]") if cat_sources else ("[gated]" if gated else "[--]")
+        print(f"  {symbol} @{as_of}  {rows[-1]['action']:5} "
+              f"conf={rows[-1]['conf']:>3}%   fwd{horizon}d={fwd:+6.2f}%  {cat_tag}")
     return rows
 
 
@@ -170,22 +264,52 @@ def main():
     ap.add_argument("--horizon",   type=int, default=20, help="forward-return scoring window (trading days)")
     ap.add_argument("--years",     type=int, default=2)
     ap.add_argument("--anonymize", action="store_true", help="mask ticker to reduce LLM look-ahead memorization")
+    ap.add_argument("--no-catalysts", dest="catalysts", action="store_false",
+                    help="disable point-in-time EDGAR catalyst reconstruction (technicals only)")
     ap.add_argument("--market",    type=str, default="us-stock", choices=["us-stock", "crypto"])
     args = ap.parse_args()
 
+    # Catalysts name the real entity -> incompatible with anonymize (would leak
+    # the ticker). Anonymize wins; disable catalysts with a clear warning.
+    if args.anonymize and args.catalysts:
+        print("  ⚠  --anonymize + catalysts are incompatible (EDGAR filings name the "
+              "issuer, leaking the ticker). Disabling catalysts for this run.")
+        args.catalysts = False
+
     cfg = load_cfg()
+    cats = "EDGAR 8-K + 13D/G/F + Form 4 (point-in-time); options-flow EXCLUDED" \
+           if args.catalysts else "none (technicals only)"
     print(f"\n  LLM eval | model={cfg.get('_fast_model')} | "
           f"anonymize={args.anonymize} | horizon={args.horizon}d")
+    print(f"  catalysts: {cats}")
     if not args.anonymize:
-        print("  ⚠  look-ahead bias risk: pre-cutoff dates may be memorized. Use --anonymize for a clean read.")
+        print("  ⚠  look-ahead bias risk: pre-cutoff dates may be memorized. "
+              "Prefer post-cutoff as-of dates (or --anonymize for a technicals-only clean read).")
 
     all_rows = []
     for sym in [s.strip() for s in args.symbols.split(",") if s.strip()]:
         print(f"\n── {sym} ──")
         all_rows += eval_symbol(sym, args.market, args.dates, args.horizon,
-                                args.years, args.anonymize, cfg)
+                                args.years, args.anonymize, cfg,
+                                use_catalysts=args.catalysts)
 
     summary = report(all_rows, args.horizon)
+
+    # Catalyst coverage — how much of the sample actually carried a real catalyst
+    if args.catalysts and all_rows:
+        with_cat = [r for r in all_rows if r.get("catalysts")]
+        gated    = [r for r in all_rows if r.get("gated")]
+        from collections import Counter
+        src_counts = Counter(s for r in with_cat for s in r["catalysts"])
+        print(f"  catalyst coverage: {len(with_cat)}/{len(all_rows)} decisions had "
+              f"an EDGAR catalyst | {len(gated)} gated (no catalyst + flat) | "
+              f"by source: {dict(src_counts)}")
+        print(f"  (options-flow excluded — no free point-in-time history)")
+        summary["catalyst_coverage"] = {
+            "with_catalyst": len(with_cat), "gated": len(gated),
+            "by_source": dict(src_counts), "options_flow": "excluded",
+        }
+
     out = DIR / "llm_eval_report.json"
     out.write_text(json.dumps({"run_at": datetime.now().isoformat(),
                                "args": vars(args), "summary": summary,

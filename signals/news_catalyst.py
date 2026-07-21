@@ -282,16 +282,20 @@ def _rss_news(symbol, max_age_hours=8):
 
 # ── Source 3: SEC EDGAR 8-K filings ──────────────────────────────────────────
 
-def _edgar_8k(symbol, lookback_days=7):
+def _edgar_8k(symbol, lookback_days=7, as_of=None):
     """
     Search SEC EDGAR full-text for recent 8-K filings mentioning the ticker.
     8-K = material events: M&A, earnings, exec changes, FDA, etc.
     Free — no API key. Rate limit ~10 req/s.
+
+    `as_of` (YYYY-MM-DD) pins the window end for point-in-time backtests;
+    default None = today (live behaviour, unchanged for existing callers).
     """
     signals = []
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        end_dt = datetime.strptime(as_of, "%Y-%m-%d") if as_of else datetime.now()
+        today = end_dt.strftime("%Y-%m-%d")
+        start = (end_dt - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         resp  = requests.get(
             EDGAR_URL,
             params={"q": f'"{symbol}"', "forms": "8-K",
