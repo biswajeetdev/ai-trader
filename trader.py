@@ -1160,17 +1160,26 @@ def main():
             # ── Stop-loss / profit target check ──────────────────────────────
             stop_signal = check_stops(price, symbol)
             if stop_signal and symbol in local_positions:
+                # Closing verb must follow the held direction. A SHORT is closed by
+                # COVER (a BUY); issuing SELL here would ADD to the short while
+                # record_close marked it flat — the same double-exposure bug the
+                # SHORT entry path had. Never hardcode the side on an exit.
+                _pos_dir   = str(local_positions[symbol].get("action", "BUY")).upper()
+                _is_short  = _pos_dir == "SHORT"
+                _close_verb = "COVER" if _is_short else "SELL"
+                _dir_sign   = -1 if _is_short else 1
+
                 if stop_signal == "PARTIAL_PROFIT":
-                    # Sell 50%, move stop to breakeven, keep riding the rest
+                    # Close 50%, move stop to breakeven, keep riding the rest
                     full_qty = local_positions[symbol]["quantity"]
                     half_qty = max(1, int(full_qty * 0.5)) if market != "crypto" else round(full_qty * 0.5, 6)
                     reason = f"AUTO PARTIAL: 50% exit at ${price} (3.75×ATR gain) — stop → breakeven"
-                    print(f"   >>> PARTIAL PROFIT — selling {half_qty} of {full_qty} @ ${price}")
-                    result = execute_trade(token, symbol, market, "SELL", half_qty, reason, dry_run)
+                    print(f"   >>> PARTIAL PROFIT — {_close_verb} {half_qty} of {full_qty} @ ${price}")
+                    result = execute_trade(token, symbol, market, _close_verb, half_qty, reason, dry_run)
                     if result and not dry_run:
                         mark_partial_done(symbol)
                         local_positions[symbol]["quantity"] = full_qty - half_qty
-                    trades_today.append({"symbol":symbol,"action":"SELL","quantity":half_qty,
+                    trades_today.append({"symbol":symbol,"action":_close_verb,"quantity":half_qty,
                                           "reason":reason,"confidence":100,"result":result})
                     print()
                     time.sleep(0.5)
@@ -1183,19 +1192,20 @@ def main():
                     reason = f"AUTO PROFIT TARGET: price ${price} hit target ${local_positions[symbol]['target_price']}"
                 print(f"   >>> {stop_signal} triggered! {reason}")
                 qty = local_positions[symbol]["quantity"]
-                result = execute_trade(token, symbol, market, "SELL", qty, reason, dry_run)
+                result = execute_trade(token, symbol, market, _close_verb, qty, reason, dry_run)
                 if result and not dry_run:
                     _entry = local_positions[symbol].get("entry_price", price)
                     record_close(symbol, price)
                     try:
-                        _pnl_pct = (price / _entry - 1) * 100
+                        # Direction-signed: a short profits as price falls.
+                        _pnl_pct = (price / _entry - 1) * 100 * _dir_sign
                         _regime_name = cfg.get("_bot_score", {}).get("regime", "MIXED")
                         _win = stop_signal == "PROFIT_TARGET"
                         update_bandit(_regime_name, float(macro.get("vix", 20)), 100, 1.0, _win)
-                        record_signal_outcome(symbol, "SELL", _pnl_pct, ["stop_exit"])
+                        record_signal_outcome(symbol, _close_verb, _pnl_pct, ["stop_exit"])
                     except Exception:
                         pass
-                trades_today.append({"symbol":symbol,"action":"SELL","quantity":qty,
+                trades_today.append({"symbol":symbol,"action":_close_verb,"quantity":qty,
                                       "reason":reason,"confidence":100,"result":result})
                 print()
                 time.sleep(0.5)
@@ -1405,9 +1415,12 @@ def main():
                                 pass
                     elif action in ("SELL", "COVER") and symbol in local_positions:
                         _entry = local_positions[symbol].get("entry_price", price)
+                        _sign  = -1 if str(local_positions[symbol].get("action", "BUY")
+                                           ).upper() == "SHORT" else 1
                         record_close(symbol, price)
                         try:
-                            _pnl_pct = (price / _entry - 1) * 100
+                            # Direction-signed: a short profits as price falls.
+                            _pnl_pct = (price / _entry - 1) * 100 * _sign
                             _signals_present = [k for k, v in {
                                 "options_flow": options_ctx, "whale": whale_ctx,
                                 "insider": ins_ctx, "news": news_ctx,
