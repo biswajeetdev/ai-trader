@@ -33,8 +33,8 @@ from signals.india_signals     import get_nse_bulk_deals, get_india_vix, get_nse
 from broker.ai4trade   import auth, get_profile, execute_trade, get_positions_api, refresh_token
 from rag.pattern_memory import get_rag_context
 from broker.alpaca_exec import execute_alpaca_trade, get_alpaca_portfolio, export_alpaca_to_excel
-from broker.telegram_notifier import send_trade_alert, send_daily_summary as tg_daily_summary, send_run_status
-from signals.short_put_screener import find_short_put_opportunity, check_exits as sp_check_exits, load_positions as sp_load_positions
+from broker.telegram_notifier import send_trade_alert, send_daily_summary as tg_daily_summary, send_run_status, send_error_alert
+from signals.short_put_screener import find_short_put_opportunity, check_exits as sp_check_exits, load_positions as sp_load_positions, settle_expired as sp_settle_expired
 from broker.short_put_exec import execute_short_put, close_short_put
 from signals.india_short_put_screener import (
     find_india_short_put_opportunity, check_india_exits,
@@ -669,6 +669,20 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
 
     # ── Check exits ───────────────────────────────────────────────────────────
     for pos in sp_check_exits():
+        if pos.get("expired"):
+            s = sp_settle_expired(pos)
+            pnl_str = f"${s['pnl']:+,.0f}" if s["pnl"] is not None else "P&L unknown"
+            print(f"   [SP] SETTLED {s['symbol']} ${s['strike']:.0f}P — "
+                  f"{s['outcome']} ({pos['close_reason']}) | {pnl_str}")
+            if s["outcome"] == "ASSIGNED":
+                print(f"        ↳ assigned {s['qty'] * 100} shares @ ${s['strike']:.2f} "
+                      f"— verify stock position against broker")
+            elif s["outcome"] == "UNKNOWN":
+                print(f"        ↳ could not fetch settlement price — RECONCILE MANUALLY")
+            trades.append({"action": "SETTLE_PUT", "symbol": s["symbol"],
+                           "reason": s["outcome"], "pnl": s["pnl"] or 0})
+            continue
+
         current = pos.get("current_premium") or pos.get("entry_premium", 0) * 0.01
         reason  = pos.get("close_reason", "exit")
         result  = close_short_put(cfg, pos, current, dry_run)
@@ -1083,6 +1097,11 @@ def main():
     except Exception:
         pass
 
+    # Data-health tally — a run where most symbols return no price data is a
+    # FAILED run, not a quiet zero-trade day. Without this the bot reported
+    # "Trades today: 0" while blind, and nobody noticed for two months.
+    data_ok, data_blind = 0, []
+
     for item in cfg.get("watchlist", []):
         symbol = item["symbol"]
         market = item["market"]
@@ -1105,6 +1124,7 @@ def main():
             df     = yf.download(ticker, period="90d", interval="1d",
                                   progress=False, auto_adjust=True)
             ind    = compute_indicators(df)
+            data_ok += 1
             # Multi-timeframe: 4h RSI confirmation
             try:
                 df_4h = yf.download(symbol if "." in symbol or market == "crypto"
@@ -1371,6 +1391,8 @@ def main():
                 print(f"  — {reason}")
 
         except (json.JSONDecodeError, ValueError, KeyError) as e:
+            if "days of data" in str(e) or "No data" in str(e):
+                data_blind.append(symbol)
             print(f"   [SKIP — bad response] {e}")
         except Exception as e:
             if "429" in str(e) or "RateLimitReached" in str(e) or "rate limit" in str(e).lower():
@@ -1432,9 +1454,27 @@ def main():
     print()
 
     # ── Post-run ──────────────────────────────────────────────────────────────
+    seen = data_ok + len(data_blind)
+    blind_pct = (len(data_blind) / seen * 100) if seen else 0.0
+    degraded  = seen > 0 and blind_pct >= 50
+
     print(f"{'='*62}")
     print(f"  Trades today : {len(trades_today)}")
     print(f"  Open positions tracked : {len(load_positions())}")
+    print(f"  Data health : {data_ok}/{seen} symbols priced"
+          f"{f' — BLIND on {len(data_blind)}' if data_blind else ''}")
+    if degraded:
+        print(f"  {'!'*56}")
+        print(f"  !! RUN DEGRADED — {blind_pct:.0f}% of symbols had no price data.")
+        print(f"  !! No decision was possible for: {', '.join(data_blind[:12])}")
+        print(f"  !! This is a FAILED run, not a flat day. Check network/yfinance.")
+        print(f"  {'!'*56}")
+        try:
+            send_error_alert(cfg, f"RUN DEGRADED — blind on {len(data_blind)}/{seen} "
+                                  f"symbols ({blind_pct:.0f}%). No decisions possible. "
+                                  f"Missing: {', '.join(data_blind[:8])}")
+        except Exception:
+            pass
     print(f"  Dashboard : https://ai4trade.ai/agent/10954")
     print(f"{'='*62}\n")
 

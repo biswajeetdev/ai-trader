@@ -7,7 +7,7 @@ Exit:  50% profit or DTE <= 7 (gamma risk).
 
 import json
 import yfinance as yf
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 POSITIONS_FILE = Path(__file__).parent.parent / "short_put_positions.json"
@@ -127,6 +127,13 @@ def check_exits() -> list[dict]:
     for symbol, pos in list(positions.items()):
         try:
             dte = (date.fromisoformat(pos["expiry"]) - today).days
+            if dte < 0:
+                # Already expired — the contract no longer trades, so a close
+                # order can never fill. Flag for settlement instead, or it is
+                # retried forever and permanently occupies a MAX_OPEN slot.
+                to_close.append({**pos, "close_reason": f"EXPIRED {-dte}d ago",
+                                 "current_premium": None, "expired": True})
+                continue
             if dte <= GAMMA_DTE:
                 to_close.append({**pos, "close_reason": f"DTE={dte}", "current_premium": None})
                 continue
@@ -148,3 +155,46 @@ def check_exits() -> list[dict]:
             pass
 
     return to_close
+
+
+def settle_expired(pos: dict) -> dict:
+    """
+    Settle a short put whose expiry has already passed.
+
+    An expired contract cannot be closed by order, so the position is resolved
+    from the underlying's close on the expiry date and removed from tracking:
+      close >= strike -> expired worthless, keep the full credit
+      close <  strike -> assigned at strike, credit minus intrinsic
+
+    If the settlement price cannot be fetched the position is still released
+    (the contract is gone either way) and flagged UNKNOWN for manual review —
+    leaving it in place would occupy a MAX_OPEN slot forever.
+    """
+    symbol = pos["symbol"]
+    strike = float(pos["strike"])
+    qty    = int(pos.get("qty", 1))
+    credit = float(pos.get("credit", pos.get("entry_premium", 0) * 100 * qty))
+
+    outcome, settle_px, pnl = "UNKNOWN", None, None
+    try:
+        exp = date.fromisoformat(pos["expiry"])
+        df  = yf.download(symbol, start=exp.isoformat(),
+                          end=(exp + timedelta(days=5)).isoformat(),
+                          progress=False, auto_adjust=True)
+        if not df.empty:
+            settle_px = float(df["Close"].squeeze().iloc[0])
+            if settle_px >= strike:
+                outcome, pnl = "EXPIRED_WORTHLESS", round(credit, 2)
+            else:
+                intrinsic = (strike - settle_px) * 100 * qty
+                outcome, pnl = "ASSIGNED", round(credit - intrinsic, 2)
+    except Exception:
+        pass
+
+    positions = load_positions()
+    positions.pop(symbol, None)
+    save_positions(positions)
+
+    return {"symbol": symbol, "strike": strike, "expiry": pos["expiry"],
+            "outcome": outcome, "settle_price": settle_px, "pnl": pnl,
+            "credit": credit, "qty": qty}
