@@ -10,6 +10,8 @@ import yfinance as yf
 from datetime import date, timedelta
 from pathlib import Path
 
+from broker.state_io import atomic_write_json
+
 POSITIONS_FILE = Path(__file__).parent.parent / "short_put_positions.json"
 
 MAX_VIX          = 25
@@ -35,7 +37,7 @@ def load_positions() -> dict:
 
 
 def save_positions(data: dict) -> None:
-    POSITIONS_FILE.write_text(json.dumps(data, indent=2))
+    atomic_write_json(POSITIONS_FILE, data)
 
 
 def find_short_put_opportunity(symbol: str, ind: dict, fund: dict,

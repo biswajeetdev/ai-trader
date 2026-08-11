@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from broker.ai4trade import get_positions_api
+from broker.state_io import atomic_write_json
 
 DIR        = Path(__file__).parent.parent
 POSITIONS  = DIR / "positions.json"
@@ -33,22 +34,45 @@ def load_positions() -> dict:
 
 
 def save_positions(pos: dict) -> None:
-    POSITIONS.write_text(json.dumps(pos, indent=2))
+    atomic_write_json(POSITIONS, pos)
 
 
-def record_open(symbol: str, price: float, qty: float, atr: float, market: str) -> None:
+def record_open(symbol: str, price: float, qty: float, atr: float, market: str,
+                action: str = "BUY") -> None:
+    """
+    Record a new position.
+
+    `action` must be "BUY" or "SHORT". A short's stop sits ABOVE entry and its
+    target BELOW — the mirror of a long. Previously every position was stamped
+    "BUY" regardless, so a short got a stop below entry (a profit level) and a
+    target above it (a loss level), and check_stops closed shorts backwards.
+
+    `qty` is stored as a positive size; direction lives in `action`.
+    """
+    action = action.upper()
+    if action not in ("BUY", "SHORT"):
+        raise ValueError(f"record_open: action must be BUY or SHORT, got {action!r}")
+
+    qty = abs(qty)
+    if action == "BUY":
+        stop   = round(price - STOP_LOSS_ATR * atr, 4)
+        target = round(price + PROFIT_TARGET_ATR * atr, 4)
+    else:
+        stop   = round(price + STOP_LOSS_ATR * atr, 4)
+        target = round(price - PROFIT_TARGET_ATR * atr, 4)
+
     pos = load_positions()
     pos[symbol] = {
-        "action":       "BUY",
+        "action":       action,
         "entry_price":  price,
         "quantity":     qty,
         "atr":          atr,
         "atr_at_entry": atr,
         "market":       market,
         "entry_date":   datetime.now().strftime("%Y-%m-%d"),
-        "stop_price":   round(price - STOP_LOSS_ATR  * atr, 4),
-        "target_price": round(price + PROFIT_TARGET_ATR * atr, 4),
-        "trail_stop":   round(price - STOP_LOSS_ATR  * atr, 4),
+        "stop_price":   stop,
+        "target_price": target,
+        "trail_stop":   stop,
         "partial_done": False,
     }
     save_positions(pos)
@@ -62,50 +86,85 @@ def record_close(symbol: str, exit_price: float) -> None:
     if not entry:
         return
     hist = json.loads(TRADE_HIST.read_text()) if TRADE_HIST.exists() else []
-    qty  = entry.get("quantity", 0)
-    pnl  = round((exit_price - entry["entry_price"]) * qty, 2)
+    qty   = entry.get("quantity", 0)
+    entry_px = entry["entry_price"]
+    # Direction sign: a short profits when price falls. Both pnl and pnl_pct must
+    # carry that, because update_from_trade_history() and
+    # bootstrap_from_trade_history() both read pnl_pct — an unflipped sign taught
+    # the bandit that every profitable short was a loss.
+    sign = -1 if str(entry.get("action", "BUY")).upper() == "SHORT" else 1
+    pnl  = round((exit_price - entry_px) * abs(qty) * sign, 2)
     hist.append({
         "symbol":     symbol,
         "market":     entry.get("market", ""),
-        "entry":      entry["entry_price"],
+        "action":     entry.get("action", "BUY"),
+        "entry":      entry_px,
         "exit":       exit_price,
         "qty":        qty,
         "pnl":        pnl,
-        "pnl_pct":    round((exit_price / entry["entry_price"] - 1) * 100, 2),
+        "pnl_pct":    round((exit_price / entry_px - 1) * 100 * sign, 2),
         "outcome":    "WIN" if pnl > 0 else "LOSS",
         "entry_date": entry.get("entry_date", ""),
         "exit_date":  datetime.now().strftime("%Y-%m-%d"),
     })
     if len(hist) > 50:
         hist = hist[-50:]
-    TRADE_HIST.write_text(json.dumps(hist, indent=2))
+    atomic_write_json(TRADE_HIST, hist)
 
 
 def check_stops(current_price: float, symbol: str) -> str | None:
-    """Returns 'STOP_LOSS', 'PROFIT_TARGET', 'PARTIAL_PROFIT', 'TRAIL_STOP', or None."""
+    """
+    Returns 'STOP_LOSS', 'PROFIT_TARGET', 'PARTIAL_PROFIT', 'TRAIL_STOP', or None.
+
+    Every comparison is mirrored for shorts: the stop is above entry, the target
+    below, and the trail ratchets DOWN. Positions flagged `unmanaged` are skipped
+    — those were adopted from the broker with a reconstructed basis, so acting on
+    a derived stop could close a real position at an arbitrary level.
+    """
     positions = load_positions()
     pos = positions.get(symbol)
-    if not pos or pos["action"] != "BUY":
+    if not pos:
         return None
-    if current_price <= pos["stop_price"]:
-        return "STOP_LOSS"
-    if current_price >= pos["target_price"]:
-        return "PROFIT_TARGET"
+
+    action = str(pos.get("action", "BUY")).upper()
+    if action not in ("BUY", "SHORT"):
+        return None
+    if pos.get("unmanaged"):
+        return None
+
+    is_short = action == "SHORT"
+    entry    = pos["entry_price"]
+    atr      = pos.get("atr", 0)
+
+    if is_short:
+        if current_price >= pos["stop_price"]:
+            return "STOP_LOSS"
+        if current_price <= pos["target_price"]:
+            return "PROFIT_TARGET"
+    else:
+        if current_price <= pos["stop_price"]:
+            return "STOP_LOSS"
+        if current_price >= pos["target_price"]:
+            return "PROFIT_TARGET"
+
     # Partial exit: 50% off at halfway to target, then move stop to breakeven
-    entry = pos["entry_price"]
-    atr   = pos.get("atr", 0)
     if not pos.get("partial_done") and atr > 0:
-        if current_price >= entry + PARTIAL_TARGET_ATR * atr:
+        half = PARTIAL_TARGET_ATR * atr
+        if (current_price <= entry - half) if is_short else (current_price >= entry + half):
             return "PARTIAL_PROFIT"
-    # Chandelier trailing stop: init if unset, then ratchet upward only
+
+    # Chandelier trailing stop — ratchets one way only, toward profit
+    new_trail = chandelier_exit([current_price], atr, short=is_short)
     if pos.get("trail_stop") is None:
-        pos["trail_stop"] = round(chandelier_exit([current_price], atr), 4)
-    new_trail = chandelier_exit([current_price], atr)
-    if new_trail > pos["trail_stop"]:
+        pos["trail_stop"] = round(new_trail, 4)
+    elif (new_trail < pos["trail_stop"]) if is_short else (new_trail > pos["trail_stop"]):
         pos["trail_stop"] = round(new_trail, 4)
     positions[symbol] = pos
     save_positions(positions)
-    if current_price <= pos["trail_stop"]:
+
+    hit_trail = (current_price >= pos["trail_stop"] if is_short
+                 else current_price <= pos["trail_stop"])
+    if hit_trail:
         return "TRAIL_STOP"
     return None
 
@@ -147,7 +206,7 @@ def load_hwm() -> dict:
 
 
 def save_hwm(hwm: dict) -> None:
-    HWM_FILE.write_text(json.dumps(hwm, indent=2))
+    atomic_write_json(HWM_FILE, hwm)
 
 
 def _portfolio_value(token: str, cash: float) -> tuple[float, bool]:
@@ -232,8 +291,12 @@ def vol_target_scalar(equity_history: list[float], target_vol: float = 0.12) -> 
     rv = np.std(ret[-20:]) * np.sqrt(252)
     return float(np.clip(target_vol / rv, 0.25, 2.0)) if rv > 0 else 1.0
 
-def chandelier_exit(high_series: list[float], atr: float, multiplier: float = 3.0) -> float:
-    return max(high_series) - multiplier * atr  # highest-high trailing stop
+def chandelier_exit(high_series: list[float], atr: float, multiplier: float = 3.0,
+                    short: bool = False) -> float:
+    # Long: highest-high minus ATR band. Short: lowest-low plus ATR band.
+    if short:
+        return min(high_series) + multiplier * atr
+    return max(high_series) - multiplier * atr
 
 def drawdown_radar_score(equity_history: list[float], vix: float = 20.0) -> int:
     # Composite danger score 0-100; block new trades if >60

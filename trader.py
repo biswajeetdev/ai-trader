@@ -62,7 +62,7 @@ from signals.dividend_capture    import get_dividend_signal
 from signals.cot_signal          import get_cot_signal
 from signals.short_interest      import get_short_interest_signal
 from broker.merger_arb           import get_arb_signal
-from broker.short_exec           import execute_short_sell, cover_short
+from broker.short_exec           import cover_short
 from broker.wheel_tracker        import get_assignable_symbols, update_wheel_state
 from rag.strategy_evolver        import (
     record_strategy_outcome, get_strategy_allocation_prompt,
@@ -1291,6 +1291,36 @@ def main():
                     time.sleep(0.5)
                     continue
 
+                # ── Directional pre-flight guard ──────────────────────────────
+                # execute_alpaca_trade maps SELL -> OrderSide.SELL and COVER ->
+                # OrderSide.BUY. So a "SELL" aimed at closing a SHORT would ADD
+                # to the short while record_close removed it locally — the bot
+                # would double its exposure and believe it was flat. Normalise
+                # the verb to the position's direction before anything executes.
+                _held = local_positions.get(symbol)
+                if _held:
+                    _held_dir = str(_held.get("action", "BUY")).upper()
+                    if _held_dir == "SHORT" and action == "SELL":
+                        print(f"   [GUARD] {symbol} is SHORT — closing verb SELL "
+                              f"would increase the short; treating as COVER")
+                        action = "COVER"
+                    elif _held_dir == "BUY" and action == "COVER":
+                        print(f"   [GUARD] {symbol} is LONG — COVER would buy more; "
+                              f"treating as SELL")
+                        action = "SELL"
+                elif action == "COVER":
+                    print(f"   [GUARD] COVER on {symbol} with no open position — skipping")
+                    print()
+                    continue
+
+                # Never let a closing order exceed the size actually held
+                if _held and action in ("SELL", "COVER"):
+                    _held_qty = abs(float(_held.get("quantity", 0) or 0))
+                    if _held_qty and qty > _held_qty:
+                        print(f"   [GUARD] clamping {action} {symbol} qty {qty} -> "
+                              f"{_held_qty} (size held)")
+                        qty = _held_qty if market == "crypto" else int(_held_qty)
+
                 # Correlation guard — skip if we already have a correlated position open
                 if action == "BUY":
                     corr_syms = get_correlated_symbols(symbol, local_positions)
@@ -1354,18 +1384,25 @@ def main():
                             record_strategy_outcome(symbol, "LONG_MOMENTUM", 0)
                         except Exception:
                             pass
-                    elif action == "SHORT" and not dry_run:
-                        # Execute short sell via Alpaca
-                        try:
-                            _short_result = execute_short_sell(cfg, symbol, qty)
-                            if "error" not in _short_result:
-                                record_open(symbol, price, -qty, ind["atr14"], market)
+                    elif action == "SHORT":
+                        # The order is ALREADY placed above: execute_alpaca_trade
+                        # maps any non-BUY/COVER action to OrderSide.SELL, and on
+                        # Alpaca a SELL of an unheld symbol opens the short. The
+                        # previous code called execute_short_sell() here as well,
+                        # which submitted a SECOND identical sell — doubling the
+                        # intended size. Worse, record_open() only ran if that
+                        # second call succeeded, so when it failed the first fill
+                        # stayed at the broker with no local record at all.
+                        if alpaca_result.get("error"):
+                            print(f"   [SHORT] order failed: {alpaca_result['error']}"
+                                  f" — nothing recorded")
+                        else:
+                            record_open(symbol, price, qty, ind["atr14"], market,
+                                        action="SHORT")
+                            try:
                                 record_strategy_outcome(symbol, "SHORT_REVERSION", 0)
-                                print(f"   [SHORT] Alpaca: {_short_result.get('order_id','')[:8]}...")
-                            else:
-                                print(f"   [SHORT] Error: {_short_result['error']}")
-                        except Exception as _e:
-                            print(f"   [SHORT] Exception: {_e}")
+                            except Exception:
+                                pass
                     elif action in ("SELL", "COVER") and symbol in local_positions:
                         _entry = local_positions[symbol].get("entry_price", price)
                         record_close(symbol, price)
