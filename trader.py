@@ -675,8 +675,9 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
             print(f"   [SP] SETTLED {s['symbol']} ${s['strike']:.0f}P — "
                   f"{s['outcome']} ({pos['close_reason']}) | {pnl_str}")
             if s["outcome"] == "ASSIGNED":
-                print(f"        ↳ assigned {s['qty'] * 100} shares @ ${s['strike']:.2f} "
-                      f"— verify stock position against broker")
+                print(f"        ↳ acquired {s['shares_acquired']} shares @ basis "
+                      f"${s['cost_basis']:.2f} (paper gap ${s['paper_gap']:+,.0f} "
+                      f"at expiry) — verify stock position against broker")
             elif s["outcome"] == "UNKNOWN":
                 print(f"        ↳ could not fetch settlement price — RECONCILE MANUALLY")
             trades.append({"action": "SETTLE_PUT", "symbol": s["symbol"],

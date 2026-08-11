@@ -164,7 +164,15 @@ def settle_expired(pos: dict) -> dict:
     An expired contract cannot be closed by order, so the position is resolved
     from the underlying's close on the expiry date and removed from tracking:
       close >= strike -> expired worthless, keep the full credit
-      close <  strike -> assigned at strike, credit minus intrinsic
+      close <  strike -> assigned: the credit is still kept, and shares are
+                         acquired at the strike
+
+    `pnl` is REALIZED P&L on the option only, and is the credit in both cases —
+    assignment does not realise a loss, it converts the position into stock at
+    a known basis. The paper loss on assignment lives in that stock position and
+    is reported separately as `shares_acquired` / `cost_basis`, so the learning
+    layer (update_from_trade_history, bootstrap_from_trade_history) is never
+    taught that a short put "lost" money it did not lose.
 
     If the settlement price cannot be fetched the position is still released
     (the contract is gone either way) and flagged UNKNOWN for manual review —
@@ -176,6 +184,7 @@ def settle_expired(pos: dict) -> dict:
     credit = float(pos.get("credit", pos.get("entry_premium", 0) * 100 * qty))
 
     outcome, settle_px, pnl = "UNKNOWN", None, None
+    shares_acquired, cost_basis, paper_gap = 0, None, None
     try:
         exp = date.fromisoformat(pos["expiry"])
         df  = yf.download(symbol, start=exp.isoformat(),
@@ -186,8 +195,12 @@ def settle_expired(pos: dict) -> dict:
             if settle_px >= strike:
                 outcome, pnl = "EXPIRED_WORTHLESS", round(credit, 2)
             else:
-                intrinsic = (strike - settle_px) * 100 * qty
-                outcome, pnl = "ASSIGNED", round(credit - intrinsic, 2)
+                # Assigned: credit is kept, shares acquired at the strike.
+                # The mark-to-expiry shortfall is stock P&L, not option P&L.
+                outcome, pnl = "ASSIGNED", round(credit, 2)
+                shares_acquired = 100 * qty
+                cost_basis = round(strike - credit / shares_acquired, 4)
+                paper_gap = round((settle_px - strike) * shares_acquired, 2)
     except Exception:
         pass
 
@@ -197,4 +210,5 @@ def settle_expired(pos: dict) -> dict:
 
     return {"symbol": symbol, "strike": strike, "expiry": pos["expiry"],
             "outcome": outcome, "settle_price": settle_px, "pnl": pnl,
-            "credit": credit, "qty": qty}
+            "credit": credit, "qty": qty, "shares_acquired": shares_acquired,
+            "cost_basis": cost_basis, "paper_gap": paper_gap}
