@@ -30,19 +30,17 @@ from signals.options_flow      import get_options_signals,        format_for_llm
 from signals.whale_tracker     import get_whale_signals,          format_for_llm as whale_fmt
 from signals.fear_greed        import get_fear_greed_signals,     format_for_llm as fg_fmt, get_summary as fg_summary
 from signals.india_signals     import get_nse_bulk_deals, get_india_vix, get_nse_options_flow, format_bulk_deals_for_llm
-from broker.approval_queue    import queue_trade, update_message_id
-from broker.telegram_notifier import send_approval_request
 from broker.ai4trade   import auth, get_profile, execute_trade, get_positions_api, refresh_token
 from rag.pattern_memory import get_rag_context
 from broker.alpaca_exec import execute_alpaca_trade, get_alpaca_portfolio, export_alpaca_to_excel
-from broker.telegram_notifier import send_trade_alert, send_daily_summary as tg_daily_summary, send_run_status
-from signals.short_put_screener import find_short_put_opportunity, check_exits as sp_check_exits, load_positions as sp_load_positions
+from broker.telegram_notifier import send_trade_alert, send_daily_summary as tg_daily_summary, send_run_status, send_error_alert
+from signals.short_put_screener import find_short_put_opportunity, check_exits as sp_check_exits, load_positions as sp_load_positions, settle_expired as sp_settle_expired
 from broker.short_put_exec import execute_short_put, close_short_put
 from signals.india_short_put_screener import (
     find_india_short_put_opportunity, check_india_exits,
     load_positions as india_sp_load_positions,
 )
-from broker.zerodha_exec import execute_india_short_put, close_india_short_put
+from broker.zerodha_exec import execute_india_short_put, close_india_short_put, execute_india_trade
 from signals.stock_ranker import rank_watchlist, get_rank_context
 from broker.risk        import (
     check_drawdown_circuit, check_stops, load_positions, save_positions,
@@ -50,6 +48,7 @@ from broker.risk        import (
     dynamic_position_size, get_equity_history, get_correlated_symbols,
     mark_partial_done,
     STOP_LOSS_ATR, PROFIT_TARGET_ATR, MIN_CONFIDENCE, MAX_TRADE_USD,
+    DRAWDOWN_HALT_PCT,
 )
 from signals.mean_reversion      import rsi_reversion_signal, get_pairs_signals
 from signals.screener            import get_screener_candidates
@@ -63,15 +62,12 @@ from signals.dividend_capture    import get_dividend_signal
 from signals.cot_signal          import get_cot_signal
 from signals.short_interest      import get_short_interest_signal
 from broker.merger_arb           import get_arb_signal
-from broker.short_exec           import execute_short_sell, cover_short
+from broker.short_exec           import cover_short
 from broker.wheel_tracker        import get_assignable_symbols, update_wheel_state
 from rag.strategy_evolver        import (
     record_strategy_outcome, get_strategy_allocation_prompt,
     get_recent_lessons, bootstrap_from_trade_history,
-    record_llm_outcome, get_best_llm,
 )
-from rag.trading_memory  import append_decision, get_memory_context, update_outcome
-from signals.sentiment_fetch import get_sentiment
 import dashboard.state as dash_state
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -79,12 +75,32 @@ DIR    = Path(__file__).parent
 CONFIG = DIR / "config.json"
 LOG    = DIR / "log.json"
 EXCEL  = DIR / "holdings.xlsx"
+EQUITY_CSV = DIR / "equity_curve.csv"   # NAV time series for report_perf.py (gitignored)
 # POSITIONS, TRADE_HIST, HWM_FILE, TOKEN_FILE → broker.risk / broker.ai4trade
 
 # ── constants ─────────────────────────────────────────────────────────────────
 LOG_MAX                = 500
 EARNINGS_BLACKOUT_DAYS = 5
 # STOP_LOSS_ATR, PROFIT_TARGET_ATR, MIN_CONFIDENCE, MAX_TRADE_USD live in broker.risk
+
+# ── Equity-curve logger ───────────────────────────────────────────────────────
+def log_equity(equity: float, cash: float) -> None:
+    """Append one NAV point (timestamp, equity, cash, holdings) to equity_curve.csv.
+
+    This is the time series report_perf.py turns into Sharpe/drawdown/win-rate.
+    Best-effort: never let logging break a trading run.
+    """
+    try:
+        holdings   = round(float(equity) - float(cash), 2)
+        row        = f"{datetime.now().isoformat(timespec='seconds')},{round(float(equity),2)},{round(float(cash),2)},{holdings}\n"
+        write_hdr  = not EQUITY_CSV.exists()
+        with open(EQUITY_CSV, "a") as f:
+            if write_hdr:
+                f.write("timestamp,total_equity,cash,holdings\n")
+            f.write(row)
+    except Exception:
+        pass
+
 
 # ── Entry timing gate ─────────────────────────────────────────────────────────
 def _is_good_entry_window() -> bool:
@@ -120,8 +136,17 @@ def gh_token():
         return None
 
 
+def _freellmapi_key():
+    """Unified key for the local FreeLLMAPI proxy (free-tier pool). Read from a file
+    (launchd strips env) outside the repo; returns None if the proxy isn't set up."""
+    try:
+        return Path("~/freellmapi/.unified-key").expanduser().read_text().strip()
+    except Exception:
+        return None
+
+
 def detect_llm_backend():
-    """Priority: Ollama local (pendrive) → GitHub Models → Anthropic. Result cached per process."""
+    """Priority: Ollama local → FreeLLMAPI proxy → GitHub Models. Result cached per process."""
     global _LLM_BACKEND
     if _LLM_BACKEND is not None:
         return _LLM_BACKEND
@@ -137,7 +162,19 @@ def detect_llm_backend():
     except Exception:
         pass
 
-    # 2. GitHub Models
+    # 2. FreeLLMAPI local proxy — stacks free-tier providers; avoids the GitHub
+    #    Models daily cap. GitHub Models stays as the next fallback below.
+    pkey = _freellmapi_key()
+    if pkey:
+        try:
+            requests.get("http://localhost:3001/api/auth/status", timeout=2)
+            _LLM_BACKEND = (OpenAI(base_url="http://localhost:3001/v1", api_key=pkey),
+                            "llama-3.3-70b-versatile", "FreeLLMAPI/groq-llama-3.3-70b")
+            return _LLM_BACKEND
+        except Exception:
+            pass
+
+    # 3. GitHub Models
     key = os.environ.get("GITHUB_TOKEN") or gh_token()
     if key:
         _LLM_BACKEND = (OpenAI(base_url="https://models.inference.ai.azure.com", api_key=key),
@@ -632,6 +669,21 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
 
     # ── Check exits ───────────────────────────────────────────────────────────
     for pos in sp_check_exits():
+        if pos.get("expired"):
+            s = sp_settle_expired(pos)
+            pnl_str = f"${s['pnl']:+,.0f}" if s["pnl"] is not None else "P&L unknown"
+            print(f"   [SP] SETTLED {s['symbol']} ${s['strike']:.0f}P — "
+                  f"{s['outcome']} ({pos['close_reason']}) | {pnl_str}")
+            if s["outcome"] == "ASSIGNED":
+                print(f"        ↳ acquired {s['shares_acquired']} shares @ basis "
+                      f"${s['cost_basis']:.2f} (paper gap ${s['paper_gap']:+,.0f} "
+                      f"at expiry) — verify stock position against broker")
+            elif s["outcome"] == "UNKNOWN":
+                print(f"        ↳ could not fetch settlement price — RECONCILE MANUALLY")
+            trades.append({"action": "SETTLE_PUT", "symbol": s["symbol"],
+                           "reason": s["outcome"], "pnl": s["pnl"] or 0})
+            continue
+
         current = pos.get("current_premium") or pos.get("entry_premium", 0) * 0.01
         reason  = pos.get("close_reason", "exit")
         result  = close_short_put(cfg, pos, current, dry_run)
@@ -649,6 +701,7 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
     # ── Screen for new entries ────────────────────────────────────────────────
     vix = macro.get("vix")
     us_stocks = [item for item in watchlist if item.get("market") == "us-stock"]
+    candidates = []   # collected during screening, then executed cheapest-first
 
     for item in us_stocks:
         symbol = item["symbol"]
@@ -689,18 +742,33 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
             print(f"   [SP] {symbol}{rank_tag} ${opp['strike']}P exp {opp['expiry']} "
                   f"({opp['dte']}DTE, {opp['otm_pct']}% OTM) "
                   f"bid ${opp['premium']} → credit ${opp['credit']}")
-
-            result = execute_short_put(cfg, opp, dry_run)
-            if "error" in result:
-                print(f"        ✗ {result['error']}")
-            else:
-                tag = "[DRY]" if dry_run else f"[{result.get('status','')}]"
-                print(f"        ✓ {tag} order {str(result.get('alpaca_order_id',''))[:8]}")
-                trades.append({"action": "SHORT_PUT", "symbol": symbol,
-                               "strike": opp["strike"], "expiry": opp["expiry"],
-                               "premium": opp["premium"], "credit": opp["credit"]})
+            candidates.append((symbol, opp))
         except Exception as e:
             print(f"   [SP] {symbol} skipped: {e}")
+
+    # ── Execute cheapest-collateral-first under a concurrent cap ───────────────
+    # Cheaper underlyings (smaller strike*100 collateral) fill first so the
+    # account opens the most CSPs it can afford; the buying-power guard in
+    # execute_short_put then skips any that don't fit. sp_max_concurrent is a
+    # soft risk cap (override in config.json).
+    max_concurrent = cfg.get("sp_max_concurrent", 8)
+    open_count = len(sp_load_positions())
+    for symbol, opp in sorted(candidates, key=lambda x: x[1]["strike"]):
+        if open_count >= max_concurrent:
+            print(f"   [SP] {symbol} skipped — concurrent CSP cap reached ({max_concurrent})")
+            continue
+        result = execute_short_put(cfg, opp, dry_run)
+        if result.get("skipped"):
+            print(f"        ⊘ {symbol} skipped — {result['reason']}")
+        elif "error" in result:
+            print(f"        ✗ {result['error']}")
+        else:
+            tag = "[DRY]" if dry_run else f"[{result.get('status','')}]"
+            print(f"        ✓ {tag} order {str(result.get('alpaca_order_id',''))[:8]}")
+            open_count += 1
+            trades.append({"action": "SHORT_PUT", "symbol": symbol,
+                           "strike": opp["strike"], "expiry": opp["expiry"],
+                           "premium": opp["premium"], "credit": opp["credit"]})
 
     return trades
 
@@ -798,11 +866,13 @@ def main():
     print(f"  Market : {'OPEN' if is_market_open() else 'CLOSED'}")
     print(f"{'='*62}\n")
 
-    # Launch Bloomberg terminal only if not already running
+    # Launch Bloomberg terminal in a new Terminal.app window
     dash_state.set_status("RUNNING")
     try:
         import subprocess as _sp
         _dash = Path(__file__).parent / "dashboard" / "terminal.py"
+        # Only open a dashboard window if one isn't already running — otherwise
+        # every 30-min cron run would spawn another Terminal window.
         _already = _sp.run(
             ["pgrep", "-f", "dashboard/terminal.py"],
             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
@@ -830,7 +900,9 @@ def main():
     profile = get_profile(token)
     cash    = float(profile.get("cash", 100_000))
     print(f"Account : {profile.get('name')}  |  Cash: ${cash:,.2f}\n")
-    dash_state.update_account(equity=float(profile.get('portfolio_value', cash)), cash=cash)
+    total_equity = float(profile.get("portfolio_value", cash))
+    dash_state.update_account(equity=total_equity, cash=cash)
+    log_equity(total_equity, cash)     # append NAV point for report_perf.py
 
     # ── Drawdown circuit breaker (persists across runs via portfolio_hwm.json) ─
     dd_halted, port_value, dd_pct, peak = check_drawdown_circuit(token, cash)
@@ -863,7 +935,7 @@ def main():
     dash_state.update_macro(
         vix=float(macro.get("vix") or 0),
         spy_5d=float(macro.get("spy_5d_pct") or 0),
-        fg_score=int(macro.get("fear_greed", 0) or 0),
+        fg_score=int(macro.get("fear_greed", 0)),
         bot_score=cfg.get("_bot_score", {}).get("score", 50),
         regime=cfg.get("_bot_score", {}).get("regime", ""),
     )
@@ -992,6 +1064,7 @@ def main():
         win_rate_summary = _base_summary
 
     # ── Strategy self-evolution (bandit scores + post-mortem lessons) ─────────
+    # ── Strategy self-evolution context (bandit + post-mortem lessons) ────────
     try:
         strategy_ctx = get_strategy_allocation_prompt()
         lessons_ctx  = get_recent_lessons(5)
@@ -999,7 +1072,7 @@ def main():
         strategy_ctx = ""
         lessons_ctx  = ""
 
-    # Push strategy/lesson state to dashboard
+    # Push to dashboard
     try:
         from rag.strategy_evolver import _load as _se_load
         _se_data = _se_load()
@@ -1025,6 +1098,11 @@ def main():
     except Exception:
         pass
 
+    # Data-health tally — a run where most symbols return no price data is a
+    # FAILED run, not a quiet zero-trade day. Without this the bot reported
+    # "Trades today: 0" while blind, and nobody noticed for two months.
+    data_ok, data_blind = 0, []
+
     for item in cfg.get("watchlist", []):
         symbol = item["symbol"]
         market = item["market"]
@@ -1047,6 +1125,7 @@ def main():
             df     = yf.download(ticker, period="90d", interval="1d",
                                   progress=False, auto_adjust=True)
             ind    = compute_indicators(df)
+            data_ok += 1
             # Multi-timeframe: 4h RSI confirmation
             try:
                 df_4h = yf.download(symbol if "." in symbol or market == "crypto"
@@ -1081,17 +1160,26 @@ def main():
             # ── Stop-loss / profit target check ──────────────────────────────
             stop_signal = check_stops(price, symbol)
             if stop_signal and symbol in local_positions:
+                # Closing verb must follow the held direction. A SHORT is closed by
+                # COVER (a BUY); issuing SELL here would ADD to the short while
+                # record_close marked it flat — the same double-exposure bug the
+                # SHORT entry path had. Never hardcode the side on an exit.
+                _pos_dir   = str(local_positions[symbol].get("action", "BUY")).upper()
+                _is_short  = _pos_dir == "SHORT"
+                _close_verb = "COVER" if _is_short else "SELL"
+                _dir_sign   = -1 if _is_short else 1
+
                 if stop_signal == "PARTIAL_PROFIT":
-                    # Sell 50%, move stop to breakeven, keep riding the rest
+                    # Close 50%, move stop to breakeven, keep riding the rest
                     full_qty = local_positions[symbol]["quantity"]
                     half_qty = max(1, int(full_qty * 0.5)) if market != "crypto" else round(full_qty * 0.5, 6)
                     reason = f"AUTO PARTIAL: 50% exit at ${price} (3.75×ATR gain) — stop → breakeven"
-                    print(f"   >>> PARTIAL PROFIT — selling {half_qty} of {full_qty} @ ${price}")
-                    result = execute_trade(token, symbol, market, "SELL", half_qty, reason, dry_run)
+                    print(f"   >>> PARTIAL PROFIT — {_close_verb} {half_qty} of {full_qty} @ ${price}")
+                    result = execute_trade(token, symbol, market, _close_verb, half_qty, reason, dry_run)
                     if result and not dry_run:
                         mark_partial_done(symbol)
                         local_positions[symbol]["quantity"] = full_qty - half_qty
-                    trades_today.append({"symbol":symbol,"action":"SELL","quantity":half_qty,
+                    trades_today.append({"symbol":symbol,"action":_close_verb,"quantity":half_qty,
                                           "reason":reason,"confidence":100,"result":result})
                     print()
                     time.sleep(0.5)
@@ -1104,19 +1192,20 @@ def main():
                     reason = f"AUTO PROFIT TARGET: price ${price} hit target ${local_positions[symbol]['target_price']}"
                 print(f"   >>> {stop_signal} triggered! {reason}")
                 qty = local_positions[symbol]["quantity"]
-                result = execute_trade(token, symbol, market, "SELL", qty, reason, dry_run)
+                result = execute_trade(token, symbol, market, _close_verb, qty, reason, dry_run)
                 if result and not dry_run:
                     _entry = local_positions[symbol].get("entry_price", price)
                     record_close(symbol, price)
                     try:
-                        _pnl_pct = (price / _entry - 1) * 100
+                        # Direction-signed: a short profits as price falls.
+                        _pnl_pct = (price / _entry - 1) * 100 * _dir_sign
                         _regime_name = cfg.get("_bot_score", {}).get("regime", "MIXED")
                         _win = stop_signal == "PROFIT_TARGET"
                         update_bandit(_regime_name, float(macro.get("vix", 20)), 100, 1.0, _win)
-                        record_signal_outcome(symbol, "SELL", _pnl_pct, ["stop_exit"])
+                        record_signal_outcome(symbol, _close_verb, _pnl_pct, ["stop_exit"])
                     except Exception:
                         pass
-                trades_today.append({"symbol":symbol,"action":"SELL","quantity":qty,
+                trades_today.append({"symbol":symbol,"action":_close_verb,"quantity":qty,
                                       "reason":reason,"confidence":100,"result":result})
                 print()
                 time.sleep(0.5)
@@ -1171,16 +1260,6 @@ def main():
                 bb_pattern_ctx = ""
 
             try:
-                # Fetch live social sentiment + cumulative decision memory
-                _sentiment_ctx = ""
-                try:
-                    _sentiment_ctx = get_sentiment(symbol)
-                    if _sentiment_ctx:
-                        dash_state.update_pipeline("sentiment", "OK")
-                except Exception:
-                    pass
-                _memory_ctx = get_memory_context(symbol=symbol, n=6)
-                dash_state.update_pipeline("debate", "RUNNING")
                 dec = debate_decide(symbol, market, ind, fund, macro,
                                     cash, social_ctx, ins_ctx, earn_s, cfg,
                                     news_ctx=news_ctx, options_ctx=options_ctx,
@@ -1191,9 +1270,7 @@ def main():
                                     rank_ctx=rank_ctx,
                                     poly_ctx=poly_ctx,
                                     strategy_ctx=strategy_ctx,
-                                    lessons_ctx=lessons_ctx,
-                                    memory_ctx=_memory_ctx,
-                                    sentiment_ctx=_sentiment_ctx)
+                                    lessons_ctx=lessons_ctx)
                 print(f"   [{dec.get('consensus','?')} consensus]  "
                       f"Bull: {dec.get('bull_arg','')[:60]}...")
                 print(f"   Bear: {dec.get('bear_arg','')[:60]}...")
@@ -1209,8 +1286,6 @@ def main():
                 dec = llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_pos)
             action, qty, conf, reason = dec["action"], dec["quantity"], dec["confidence"], dec["reason"]
             reasoning = dec["reasoning"]
-            dash_state.update_pipeline("arbiter", "OK")
-            append_decision(symbol, action, conf, reason)
 
             print(f"   Conf {conf}% | {reasoning.get('technical','')[:80]}")
             print(f"   Risks: {reasoning.get('risks','N/A')[:80]}")
@@ -1225,6 +1300,36 @@ def main():
                     print()
                     time.sleep(0.5)
                     continue
+
+                # ── Directional pre-flight guard ──────────────────────────────
+                # execute_alpaca_trade maps SELL -> OrderSide.SELL and COVER ->
+                # OrderSide.BUY. So a "SELL" aimed at closing a SHORT would ADD
+                # to the short while record_close removed it locally — the bot
+                # would double its exposure and believe it was flat. Normalise
+                # the verb to the position's direction before anything executes.
+                _held = local_positions.get(symbol)
+                if _held:
+                    _held_dir = str(_held.get("action", "BUY")).upper()
+                    if _held_dir == "SHORT" and action == "SELL":
+                        print(f"   [GUARD] {symbol} is SHORT — closing verb SELL "
+                              f"would increase the short; treating as COVER")
+                        action = "COVER"
+                    elif _held_dir == "BUY" and action == "COVER":
+                        print(f"   [GUARD] {symbol} is LONG — COVER would buy more; "
+                              f"treating as SELL")
+                        action = "SELL"
+                elif action == "COVER":
+                    print(f"   [GUARD] COVER on {symbol} with no open position — skipping")
+                    print()
+                    continue
+
+                # Never let a closing order exceed the size actually held
+                if _held and action in ("SELL", "COVER"):
+                    _held_qty = abs(float(_held.get("quantity", 0) or 0))
+                    if _held_qty and qty > _held_qty:
+                        print(f"   [GUARD] clamping {action} {symbol} qty {qty} -> "
+                              f"{_held_qty} (size held)")
+                        qty = _held_qty if market == "crypto" else int(_held_qty)
 
                 # Correlation guard — skip if we already have a correlated position open
                 if action == "BUY":
@@ -1261,17 +1366,11 @@ def main():
                 val = qty * price
                 print(f"   qty={qty}  value=${val:,.0f}  — {reason}")
 
-                # Execute on ai4trade.ai (paper) — Indian market queued for approval
+                # Execute Indian market trades via Zerodha (paper now, live when zerodha_live=true)
                 if market == "in-stock":
-                    trade_id = queue_trade(cfg, symbol, market, action, qty,
-                                           price, conf, reason, ind.get("atr14", 0))
-                    msg_id = send_approval_request(cfg, trade_id, action, symbol,
-                                                    qty, price, conf, reason)
-                    if msg_id:
-                        update_message_id(trade_id, msg_id)
-                    print(f"   → queued for Telegram approval (trade_id={trade_id})")
-                    result       = {"queued": True, "trade_id": trade_id}
-                    alpaca_result = {"skipped": "awaiting approval"}
+                    result = execute_india_trade(cfg, symbol, action, qty, reason,
+                                                 price, ind.get("atr14", 0), dry_run)
+                    alpaca_result = {"skipped": "zerodha"}
                 else:
                     result = execute_trade(token, symbol, market, action, qty, reason, dry_run)
                     # Mirror to Alpaca — BUY stocks get native bracket (stop + target)
@@ -1285,13 +1384,8 @@ def main():
 
                 send_trade_alert(cfg, action, symbol, qty, price, reason, conf,
                                  alpaca_order_id=alpaca_result.get("alpaca_order_id", ""))
-                dash_state.update_pipeline("alpaca", "OK")
                 dash_state.add_trade(action=action, symbol=symbol,
                                      qty=qty, price=price, reason=reason)
-                try:
-                    record_llm_outcome(cfg.get("model", "gpt-4o-mini"), won=(action == "BUY"))
-                except Exception:
-                    pass
 
                 if result and not dry_run:
                     if action == "BUY":
@@ -1300,23 +1394,33 @@ def main():
                             record_strategy_outcome(symbol, "LONG_MOMENTUM", 0)
                         except Exception:
                             pass
-                    elif action == "SHORT" and not dry_run:
-                        # Execute short sell via Alpaca
-                        try:
-                            _short_result = execute_short_sell(cfg, symbol, qty)
-                            if "error" not in _short_result:
-                                record_open(symbol, price, -qty, ind["atr14"], market)
+                    elif action == "SHORT":
+                        # The order is ALREADY placed above: execute_alpaca_trade
+                        # maps any non-BUY/COVER action to OrderSide.SELL, and on
+                        # Alpaca a SELL of an unheld symbol opens the short. The
+                        # previous code called execute_short_sell() here as well,
+                        # which submitted a SECOND identical sell — doubling the
+                        # intended size. Worse, record_open() only ran if that
+                        # second call succeeded, so when it failed the first fill
+                        # stayed at the broker with no local record at all.
+                        if alpaca_result.get("error"):
+                            print(f"   [SHORT] order failed: {alpaca_result['error']}"
+                                  f" — nothing recorded")
+                        else:
+                            record_open(symbol, price, qty, ind["atr14"], market,
+                                        action="SHORT")
+                            try:
                                 record_strategy_outcome(symbol, "SHORT_REVERSION", 0)
-                                print(f"   [SHORT] Alpaca: {_short_result.get('order_id','')[:8]}...")
-                            else:
-                                print(f"   [SHORT] Error: {_short_result['error']}")
-                        except Exception as _e:
-                            print(f"   [SHORT] Exception: {_e}")
+                            except Exception:
+                                pass
                     elif action in ("SELL", "COVER") and symbol in local_positions:
                         _entry = local_positions[symbol].get("entry_price", price)
+                        _sign  = -1 if str(local_positions[symbol].get("action", "BUY")
+                                           ).upper() == "SHORT" else 1
                         record_close(symbol, price)
                         try:
-                            _pnl_pct = (price / _entry - 1) * 100
+                            # Direction-signed: a short profits as price falls.
+                            _pnl_pct = (price / _entry - 1) * 100 * _sign
                             _signals_present = [k for k, v in {
                                 "options_flow": options_ctx, "whale": whale_ctx,
                                 "insider": ins_ctx, "news": news_ctx,
@@ -1338,6 +1442,8 @@ def main():
                 print(f"  — {reason}")
 
         except (json.JSONDecodeError, ValueError, KeyError) as e:
+            if "days of data" in str(e) or "No data" in str(e):
+                data_blind.append(symbol)
             print(f"   [SKIP — bad response] {e}")
         except Exception as e:
             if "429" in str(e) or "RateLimitReached" in str(e) or "rate limit" in str(e).lower():
@@ -1399,9 +1505,27 @@ def main():
     print()
 
     # ── Post-run ──────────────────────────────────────────────────────────────
+    seen = data_ok + len(data_blind)
+    blind_pct = (len(data_blind) / seen * 100) if seen else 0.0
+    degraded  = seen > 0 and blind_pct >= 50
+
     print(f"{'='*62}")
     print(f"  Trades today : {len(trades_today)}")
     print(f"  Open positions tracked : {len(load_positions())}")
+    print(f"  Data health : {data_ok}/{seen} symbols priced"
+          f"{f' — BLIND on {len(data_blind)}' if data_blind else ''}")
+    if degraded:
+        print(f"  {'!'*56}")
+        print(f"  !! RUN DEGRADED — {blind_pct:.0f}% of symbols had no price data.")
+        print(f"  !! No decision was possible for: {', '.join(data_blind[:12])}")
+        print(f"  !! This is a FAILED run, not a flat day. Check network/yfinance.")
+        print(f"  {'!'*56}")
+        try:
+            send_error_alert(cfg, f"RUN DEGRADED — blind on {len(data_blind)}/{seen} "
+                                  f"symbols ({blind_pct:.0f}%). No decisions possible. "
+                                  f"Missing: {', '.join(data_blind[:8])}")
+        except Exception:
+            pass
     print(f"  Dashboard : https://ai4trade.ai/agent/10954")
     print(f"{'='*62}\n")
 
@@ -1420,17 +1544,17 @@ def main():
     sp_open = len(sp_load_positions()) + len(india_sp_load_positions())
     send_run_status(cfg, cash, trades_today, len(load_positions()), sp_open)
 
-    # Final dashboard state update
-    dash_state.set_status("IDLE")
-    dash_state.set_current_symbol("")
-    dash_state.update_positions(list(load_positions().values()))
-
     # Daily summary email at market close
     if is_near_close() and not dry_run:
         print("Near market close — sending daily summary...")
         send_daily_summary(cfg, cash, trades_today, len(load_positions()))
         _, port_val, dd_pct, _ = check_drawdown_circuit(token, cash)
         tg_daily_summary(cfg, trades_today, cash, port_val, dd_pct * 100)
+
+    # Final dashboard state update
+    dash_state.set_status("IDLE")
+    dash_state.set_current_symbol("")
+    dash_state.update_positions(list(load_positions().values()))
 
 
 if __name__ == "__main__":

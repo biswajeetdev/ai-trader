@@ -18,6 +18,11 @@ pending_trades.json
 short_put_positions.json
 pairs_spread.json
 backtest_report.json
+equity_curve.csv
+data/cache/
+report_perf.html
+report_perf_quantstats.html
+llm_eval_report.json
 god_mode_output.log
 god_mode_report.json
 god_mode_vbt_report.json

@@ -18,9 +18,12 @@ import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from data.history import get_daily   # resilient OHLCV: cache -> yfinance -> Alpaca
+
 warnings.filterwarnings("ignore")
 DIR = Path(__file__).parent
 COMMISSION = 0.0005   # 0.05% per side
+SLIPPAGE   = 0.0005   # 0.05% adverse fill vs reference price (per side); override via params["slippage"]
 
 
 # ── Load optimized params (fallback to sensible defaults) ────────────────────
@@ -171,8 +174,7 @@ def signal(row, p, market):
 
 def run_asset(symbol, market, start, end, capital, params):
     ticker = f"{symbol}-USD" if market == "crypto" else symbol
-    df     = yf.download(ticker, start=start, end=end,
-                         interval="1d", progress=False, auto_adjust=True)
+    df     = get_daily(ticker, start, end)
     if df.empty or len(df) < 80:
         return None
 
@@ -181,6 +183,7 @@ def run_asset(symbol, market, start, end, capital, params):
     stop_m   = params.get("stop_atr", 3.0)
     target_m = params.get("target_atr", 6.0)
     risk_pct = params.get("risk_pct", 0.015)
+    slip     = params.get("slippage", SLIPPAGE)   # adverse fill: buys higher, sells lower
 
     # Lookahead fix: signal from bar T, execute at bar T+1 open
     ind["sig"] = ind.apply(lambda r: signal(r, params, market), axis=1)
@@ -210,53 +213,57 @@ def run_asset(symbol, market, start, end, capital, params):
         # ── Auto stop-loss / profit target ───────────────────────────────────
         if shares > 0:
             if close <= stop_p:
-                pnl = (close - ep) * shares - close * shares * COMMISSION
-                cash += shares * close * (1 - COMMISSION)
+                exit_px = close * (1 - slip)
+                pnl = (exit_px - ep) * shares - exit_px * shares * COMMISSION
+                cash += shares * exit_px * (1 - COMMISSION)
                 days = (date - entry_date).days if entry_date else 0
                 trades.append({"date": str(date.date()), "action": "STOP",
-                               "price": round(close, 4), "qty": shares,
+                               "price": round(exit_px, 4), "qty": shares,
                                "pnl": round(pnl, 2), "hold_days": days})
                 shares = 0; ep = ea = stop_p = tgt_p = 0; entry_date = None
                 continue
             if close >= tgt_p:
-                pnl = (close - ep) * shares - close * shares * COMMISSION
-                cash += shares * close * (1 - COMMISSION)
+                exit_px = close * (1 - slip)
+                pnl = (exit_px - ep) * shares - exit_px * shares * COMMISSION
+                cash += shares * exit_px * (1 - COMMISSION)
                 days = (date - entry_date).days if entry_date else 0
                 trades.append({"date": str(date.date()), "action": "TARGET",
-                               "price": round(close, 4), "qty": shares,
+                               "price": round(exit_px, 4), "qty": shares,
                                "pnl": round(pnl, 2), "hold_days": days})
                 shares = 0; ep = ea = stop_p = tgt_p = 0; entry_date = None
                 continue
 
         # ── Signal entry/exit ─────────────────────────────────────────────────
         if sig == "BUY" and shares == 0 and cash > fill:
+            entry_px = fill * (1 + slip)            # buys fill above the open
             risk_amt = value * risk_pct
             stop_d   = atr * stop_m
-            qty      = min(risk_amt / stop_d, 5_000 / fill)
+            qty      = min(risk_amt / stop_d, 5_000 / entry_px)
             qty      = int(qty) if market != "crypto" else round(qty, 6)
-            cost     = qty * fill * (1 + COMMISSION)
+            cost     = qty * entry_px * (1 + COMMISSION)
             if cost <= cash and qty > 0:
                 cash -= cost
-                shares = qty; ep = fill; ea = atr
+                shares = qty; ep = entry_px; ea = atr
                 stop_p = round(ep - stop_m * ea, 4)
                 tgt_p  = round(ep + target_m * ea, 4)
                 entry_date = date
                 trades.append({"date": str(date.date()), "action": "BUY",
-                               "price": round(fill, 4), "qty": qty,
+                               "price": round(entry_px, 4), "qty": qty,
                                "stop": stop_p, "target": tgt_p})
 
         elif sig == "SELL" and shares > 0:
-            pnl = (fill - ep) * shares - fill * shares * COMMISSION
-            cash += shares * fill * (1 - COMMISSION)
+            exit_px = fill * (1 - slip)             # sells fill below the open
+            pnl = (exit_px - ep) * shares - exit_px * shares * COMMISSION
+            cash += shares * exit_px * (1 - COMMISSION)
             days = (date - entry_date).days if entry_date else 0
             trades.append({"date": str(date.date()), "action": "SELL",
-                           "price": round(fill, 4), "qty": shares,
+                           "price": round(exit_px, 4), "qty": shares,
                            "pnl": round(pnl, 2), "hold_days": days})
             shares = 0; ep = ea = stop_p = tgt_p = 0; entry_date = None
 
     # Close any open position at last close
     if shares > 0:
-        last = ind["close"].iloc[-1]
+        last = ind["close"].iloc[-1] * (1 - slip)
         pnl  = (last - ep) * shares - last * shares * COMMISSION
         cash += shares * last * (1 - COMMISSION)
         days = (ind.index[-1] - entry_date).days if entry_date else 0
@@ -335,6 +342,8 @@ def main():
           f"sell: >{params.get('rsi_sell',75)}")
     print(f"  Stop: {params.get('stop_atr',3)}×ATR  Target: {params.get('target_atr',6)}×ATR  "
           f"Risk: {params.get('risk_pct',0.015)*100:.1f}%/trade")
+    print(f"  Costs: commission {COMMISSION*100:.3f}%/side  +  slippage "
+          f"{params.get('slippage', SLIPPAGE)*100:.3f}%/side")
     print(f"{'='*64}\n")
 
     results = []

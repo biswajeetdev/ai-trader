@@ -67,14 +67,18 @@ def _save_cache(data):
         pass
 
 
-def _search_edgar_filings(ticker, days_back=30):
+def _search_edgar_filings(ticker, days_back=30, as_of=None):
     """
     Search EDGAR full-text for recent filings mentioning the ticker.
     Returns 13D/G (activist) and 13F (quarterly) filings.
+
+    `as_of` (YYYY-MM-DD) pins the search window end for point-in-time backtests;
+    default None = today (live behaviour, unchanged for existing callers).
     """
     filings = []
-    start = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    end   = datetime.now().strftime("%Y-%m-%d")
+    end_dt = datetime.strptime(as_of, "%Y-%m-%d") if as_of else datetime.now()
+    start = (end_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    end   = end_dt.strftime("%Y-%m-%d")
     try:
         resp = requests.get(
             EDGAR_SEARCH,
