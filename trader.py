@@ -30,8 +30,6 @@ from signals.options_flow      import get_options_signals,        format_for_llm
 from signals.whale_tracker     import get_whale_signals,          format_for_llm as whale_fmt
 from signals.fear_greed        import get_fear_greed_signals,     format_for_llm as fg_fmt, get_summary as fg_summary
 from signals.india_signals     import get_nse_bulk_deals, get_india_vix, get_nse_options_flow, format_bulk_deals_for_llm
-from broker.approval_queue    import queue_trade, update_message_id
-from broker.telegram_notifier import send_approval_request
 from broker.ai4trade   import auth, get_profile, execute_trade, get_positions_api, refresh_token
 from rag.pattern_memory import get_rag_context
 from broker.alpaca_exec import execute_alpaca_trade, get_alpaca_portfolio, export_alpaca_to_excel
@@ -42,7 +40,7 @@ from signals.india_short_put_screener import (
     find_india_short_put_opportunity, check_india_exits,
     load_positions as india_sp_load_positions,
 )
-from broker.zerodha_exec import execute_india_short_put, close_india_short_put
+from broker.zerodha_exec import execute_india_short_put, close_india_short_put, execute_india_trade
 from signals.stock_ranker import rank_watchlist, get_rank_context
 from broker.risk        import (
     check_drawdown_circuit, check_stops, load_positions, save_positions,
@@ -50,6 +48,7 @@ from broker.risk        import (
     dynamic_position_size, get_equity_history, get_correlated_symbols,
     mark_partial_done,
     STOP_LOSS_ATR, PROFIT_TARGET_ATR, MIN_CONFIDENCE, MAX_TRADE_USD,
+    DRAWDOWN_HALT_PCT,
 )
 from signals.mean_reversion      import rsi_reversion_signal, get_pairs_signals
 from signals.screener            import get_screener_candidates
@@ -68,10 +67,7 @@ from broker.wheel_tracker        import get_assignable_symbols, update_wheel_sta
 from rag.strategy_evolver        import (
     record_strategy_outcome, get_strategy_allocation_prompt,
     get_recent_lessons, bootstrap_from_trade_history,
-    record_llm_outcome, get_best_llm,
 )
-from rag.trading_memory  import append_decision, get_memory_context, update_outcome
-from signals.sentiment_fetch import get_sentiment
 import dashboard.state as dash_state
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -101,12 +97,20 @@ def _is_good_entry_window() -> bool:
 OLLAMA_URL    = "http://localhost:11434/v1"
 OLLAMA_MODELS = ["qwen2.5:32b", "deepseek-r1:14b", "llama3.3:70b", "llama3.1:8b", "phi4"]
 GITHUB_MODEL       = "gpt-4o-mini"  # 50 req/min limit (gpt-4o was 50/day — hit every day)
+PROXY_URL     = "http://localhost:3001/v1"
+# Preference order, resolved against the proxy's live catalog at startup.
+# groq/* first (fastest, and the reason the proxy was wired in); the rest are
+# fallbacks for when groq is rate-limited. Never pin a bare id without checking
+# the catalog — that is what silently broke every decision from Jun to Aug 2026.
+PROXY_MODELS  = ["groq/compound", "groq/compound-mini",
+                 "openai/gpt-oss-120b", "Meta-Llama-3_3-70B-Instruct"]
 GITHUB_MODEL_FAST  = "gpt-4o-mini"  # debate brain: same model, 50 req/min
 
 VALID_ACTIONS = {"BUY", "SELL", "SHORT", "COVER", "HOLD"}
 VALID_MARKETS = {"us-stock", "crypto", "polymarket", "a-stock", "in-stock"}
 
 _LLM_BACKEND = None   # cached per-process; avoids repeated `gh auth token` subprocess calls
+_LLM_DEAD    = set()  # backend kinds retired this run after a call-time failure
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -120,31 +124,98 @@ def gh_token():
         return None
 
 
+def _freellmapi_key():
+    """Unified key for the local FreeLLMAPI proxy (free-tier pool). Read from a file
+    (launchd strips env) outside the repo; returns None if the proxy isn't set up."""
+    try:
+        return Path("~/freellmapi/.unified-key").expanduser().read_text().strip()
+    except Exception:
+        return None
+
+
+def _proxy_model(pkey):
+    """Pick a model the proxy will actually serve, or None if it can't be used.
+
+    The proxy's catalog changes as free-tier providers come and go, so pinning a
+    model id in source goes stale silently: every completion then 400s with
+    `model_not_found` and each symbol is skipped. Resolving against the live
+    catalog keeps this self-healing.
+
+    Note the proxy is a *pool* — it fails over to another provider when the
+    pinned one is unavailable, so a groq pin is a preference, not a guarantee.
+    """
+    try:
+        r = requests.get(f"{PROXY_URL}/models",
+                         headers={"Authorization": f"Bearer {pkey}"}, timeout=5)
+        if not r.ok:                      # 401 = key rotated/unset; fall through
+            return None
+        catalog = {m.get("id") for m in r.json().get("data", [])}
+    except Exception:
+        return None
+    if not catalog:
+        return None
+    for m in PROXY_MODELS:
+        if m in catalog:
+            return m
+    return "auto" if "auto" in catalog else None
+
+
 def detect_llm_backend():
-    """Priority: Ollama local (pendrive) → GitHub Models → Anthropic. Result cached per process."""
+    """Priority: Ollama local → FreeLLMAPI proxy → GitHub Models. Result cached per process."""
     global _LLM_BACKEND
     if _LLM_BACKEND is not None:
         return _LLM_BACKEND
     # 1. Ollama
-    try:
-        r = requests.get(f"{OLLAMA_URL.replace('/v1','')}/api/tags", timeout=2)
-        if r.ok:
-            available = {m["name"].split(":")[0] for m in r.json().get("models", [])}
-            for m in OLLAMA_MODELS:
-                if m.split(":")[0] in available:
-                    _LLM_BACKEND = OpenAI(base_url=OLLAMA_URL, api_key="ollama"), m, f"Ollama/{m} (local)"
-                    return _LLM_BACKEND
-    except Exception:
-        pass
+    if "ollama" not in _LLM_DEAD:
+        try:
+            r = requests.get(f"{OLLAMA_URL.replace('/v1','')}/api/tags", timeout=2)
+            if r.ok:
+                available = {m["name"].split(":")[0] for m in r.json().get("models", [])}
+                for m in OLLAMA_MODELS:
+                    if m.split(":")[0] in available:
+                        _LLM_BACKEND = OpenAI(base_url=OLLAMA_URL, api_key="ollama"), m, f"Ollama/{m} (local)"
+                        return _LLM_BACKEND
+        except Exception:
+            pass
 
-    # 2. GitHub Models
-    key = os.environ.get("GITHUB_TOKEN") or gh_token()
+    # 2. FreeLLMAPI local proxy — stacks free-tier providers; avoids the GitHub
+    #    Models daily cap. GitHub Models stays as the next fallback below.
+    pkey = _freellmapi_key() if "proxy" not in _LLM_DEAD else None
+    if pkey:
+        model = _proxy_model(pkey)
+        if model:
+            _LLM_BACKEND = (OpenAI(base_url=PROXY_URL, api_key=pkey),
+                            model, f"FreeLLMAPI/{model}")
+            return _LLM_BACKEND
+
+    # 3. GitHub Models
+    key = (os.environ.get("GITHUB_TOKEN") or gh_token()) if "github" not in _LLM_DEAD else None
     if key:
         _LLM_BACKEND = (OpenAI(base_url="https://models.inference.ai.azure.com", api_key=key),
                         GITHUB_MODEL, f"{GITHUB_MODEL} via GitHub Models (free)")
         return _LLM_BACKEND
 
     sys.exit("[error] No LLM backend available. Run: gh auth login")
+
+
+def _retire_backend():
+    """Mark the live backend unusable and drop the cache, so the next
+    detect_llm_backend() falls through to the one below it.
+
+    Backend choice is made once and cached, so before this a backend that
+    passed its reachability check but failed on every actual completion --
+    exactly what a stale pinned model id does -- would skip every symbol for
+    the whole run rather than failing over.
+    """
+    global _LLM_BACKEND
+    if not _LLM_BACKEND:
+        return
+    label = _LLM_BACKEND[2]
+    kind  = ("ollama" if label.startswith("Ollama") else
+             "proxy"  if label.startswith("FreeLLMAPI") else "github")
+    _LLM_DEAD.add(kind)
+    print(f"   [LLM] {label} failing — falling back")
+    _LLM_BACKEND = None
 
 
 def _read_config_raw():
@@ -436,6 +507,41 @@ Respond ONLY with valid JSON, no markdown:
 {{"reasoning":{{"technical":"<RSI MACD BB numbers>","fundamental":"<P/E earnings>","macro":"<VIX QQQ>","risks":"<top risks>","confidence":<0-100>}},"action":"BUY"|"SELL"|"HOLD","quantity":0,"reason":"<one line + key number>"}}"""
 
 
+def _parse_decision(raw):
+    """Extract the decision object from a model reply.
+
+    `json.loads` on the raw text is too brittle for the proxy pool: replies
+    arrive fenced, or with a chain-of-thought preamble before the object. Scan
+    for the first balanced {...} instead, ignoring braces inside strings.
+    """
+    if not raw:
+        raise ValueError("empty LLM response")
+    text = raw.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"no JSON object in response: {text[:120]}")
+    depth, in_str, esc = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if esc:
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(text[start:i + 1])
+    raise ValueError(f"unterminated JSON object: {text[:120]}")
+
+
 def llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_position=False):
     client, model, label = detect_llm_backend()
 
@@ -483,12 +589,31 @@ def llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_position=False):
                 f"GOVT/INSIDER TRADES:\n{insider_str}"
                 f"{pos_context}\nCash: ${cash:,.0f}")
 
-    resp = client.chat.completions.create(
-            model=model, max_tokens=350, temperature=0.1,
-            messages=[{"role":"system","content":system},{"role":"user","content":user_msg}])
-    raw = resp.choices[0].message.content.strip().lstrip("```json").rstrip("```").strip()
+    msgs = [{"role":"system","content":system},{"role":"user","content":user_msg}]
 
-    dec        = json.loads(raw)
+    def _complete(client, model):
+        # 1500, not 350: the proxy's pool is mostly reasoning models that emit a
+        # chain-of-thought pass before the object, so a 350 budget truncates it
+        # mid-JSON. Measured against this schema: 350 -> 0/5 parseable,
+        # 1500 -> 12/12. The reply itself stays ~300 chars.
+        kw = dict(model=model, max_tokens=1500, temperature=0.1, messages=msgs)
+        try:
+            # Forces strict JSON. Measured on the proxy pool: 4/4 parseable with
+            # it, 2-4/4 without (routed models otherwise prefix chain-of-thought).
+            return client.chat.completions.create(response_format={"type":"json_object"}, **kw)
+        except Exception:
+            return client.chat.completions.create(**kw)   # backend without JSON mode
+
+    try:
+        resp = _complete(client, model)
+    except Exception:
+        # Reachable-but-unusable backend: retire it and try the next one down
+        # once, rather than skipping this symbol and every one after it.
+        _retire_backend()
+        client, model, label = detect_llm_backend()
+        resp = _complete(client, model)
+
+    dec        = _parse_decision(resp.choices[0].message.content)
     reasoning  = dec.get("reasoning", {})
     confidence = int(reasoning.get("confidence", 0))
     action     = str(dec.get("action","HOLD")).upper().strip()
@@ -649,6 +774,7 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
     # ── Screen for new entries ────────────────────────────────────────────────
     vix = macro.get("vix")
     us_stocks = [item for item in watchlist if item.get("market") == "us-stock"]
+    candidates = []   # collected during screening, then executed cheapest-first
 
     for item in us_stocks:
         symbol = item["symbol"]
@@ -689,18 +815,33 @@ def run_short_put_strategy(cfg: dict, watchlist: list, macro: dict,
             print(f"   [SP] {symbol}{rank_tag} ${opp['strike']}P exp {opp['expiry']} "
                   f"({opp['dte']}DTE, {opp['otm_pct']}% OTM) "
                   f"bid ${opp['premium']} → credit ${opp['credit']}")
-
-            result = execute_short_put(cfg, opp, dry_run)
-            if "error" in result:
-                print(f"        ✗ {result['error']}")
-            else:
-                tag = "[DRY]" if dry_run else f"[{result.get('status','')}]"
-                print(f"        ✓ {tag} order {str(result.get('alpaca_order_id',''))[:8]}")
-                trades.append({"action": "SHORT_PUT", "symbol": symbol,
-                               "strike": opp["strike"], "expiry": opp["expiry"],
-                               "premium": opp["premium"], "credit": opp["credit"]})
+            candidates.append((symbol, opp))
         except Exception as e:
             print(f"   [SP] {symbol} skipped: {e}")
+
+    # ── Execute cheapest-collateral-first under a concurrent cap ───────────────
+    # Cheaper underlyings (smaller strike*100 collateral) fill first so the
+    # account opens the most CSPs it can afford; the buying-power guard in
+    # execute_short_put then skips any that don't fit. sp_max_concurrent is a
+    # soft risk cap (override in config.json).
+    max_concurrent = cfg.get("sp_max_concurrent", 8)
+    open_count = len(sp_load_positions())
+    for symbol, opp in sorted(candidates, key=lambda x: x[1]["strike"]):
+        if open_count >= max_concurrent:
+            print(f"   [SP] {symbol} skipped — concurrent CSP cap reached ({max_concurrent})")
+            continue
+        result = execute_short_put(cfg, opp, dry_run)
+        if result.get("skipped"):
+            print(f"        ⊘ {symbol} skipped — {result['reason']}")
+        elif "error" in result:
+            print(f"        ✗ {result['error']}")
+        else:
+            tag = "[DRY]" if dry_run else f"[{result.get('status','')}]"
+            print(f"        ✓ {tag} order {str(result.get('alpaca_order_id',''))[:8]}")
+            open_count += 1
+            trades.append({"action": "SHORT_PUT", "symbol": symbol,
+                           "strike": opp["strike"], "expiry": opp["expiry"],
+                           "premium": opp["premium"], "credit": opp["credit"]})
 
     return trades
 
@@ -798,11 +939,13 @@ def main():
     print(f"  Market : {'OPEN' if is_market_open() else 'CLOSED'}")
     print(f"{'='*62}\n")
 
-    # Launch Bloomberg terminal only if not already running
+    # Launch Bloomberg terminal in a new Terminal.app window
     dash_state.set_status("RUNNING")
     try:
         import subprocess as _sp
         _dash = Path(__file__).parent / "dashboard" / "terminal.py"
+        # Only open a dashboard window if one isn't already running — otherwise
+        # every 30-min cron run would spawn another Terminal window.
         _already = _sp.run(
             ["pgrep", "-f", "dashboard/terminal.py"],
             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
@@ -830,7 +973,8 @@ def main():
     profile = get_profile(token)
     cash    = float(profile.get("cash", 100_000))
     print(f"Account : {profile.get('name')}  |  Cash: ${cash:,.2f}\n")
-    dash_state.update_account(equity=float(profile.get('portfolio_value', cash)), cash=cash)
+    dash_state.update_account(equity=float(profile.get("portfolio_value", cash)),
+                               cash=cash)
 
     # ── Drawdown circuit breaker (persists across runs via portfolio_hwm.json) ─
     dd_halted, port_value, dd_pct, peak = check_drawdown_circuit(token, cash)
@@ -863,7 +1007,7 @@ def main():
     dash_state.update_macro(
         vix=float(macro.get("vix") or 0),
         spy_5d=float(macro.get("spy_5d_pct") or 0),
-        fg_score=int(macro.get("fear_greed", 0) or 0),
+        fg_score=int(macro.get("fear_greed", 0)),
         bot_score=cfg.get("_bot_score", {}).get("score", 50),
         regime=cfg.get("_bot_score", {}).get("regime", ""),
     )
@@ -992,6 +1136,7 @@ def main():
         win_rate_summary = _base_summary
 
     # ── Strategy self-evolution (bandit scores + post-mortem lessons) ─────────
+    # ── Strategy self-evolution context (bandit + post-mortem lessons) ────────
     try:
         strategy_ctx = get_strategy_allocation_prompt()
         lessons_ctx  = get_recent_lessons(5)
@@ -999,7 +1144,7 @@ def main():
         strategy_ctx = ""
         lessons_ctx  = ""
 
-    # Push strategy/lesson state to dashboard
+    # Push to dashboard
     try:
         from rag.strategy_evolver import _load as _se_load
         _se_data = _se_load()
@@ -1171,16 +1316,6 @@ def main():
                 bb_pattern_ctx = ""
 
             try:
-                # Fetch live social sentiment + cumulative decision memory
-                _sentiment_ctx = ""
-                try:
-                    _sentiment_ctx = get_sentiment(symbol)
-                    if _sentiment_ctx:
-                        dash_state.update_pipeline("sentiment", "OK")
-                except Exception:
-                    pass
-                _memory_ctx = get_memory_context(symbol=symbol, n=6)
-                dash_state.update_pipeline("debate", "RUNNING")
                 dec = debate_decide(symbol, market, ind, fund, macro,
                                     cash, social_ctx, ins_ctx, earn_s, cfg,
                                     news_ctx=news_ctx, options_ctx=options_ctx,
@@ -1191,9 +1326,7 @@ def main():
                                     rank_ctx=rank_ctx,
                                     poly_ctx=poly_ctx,
                                     strategy_ctx=strategy_ctx,
-                                    lessons_ctx=lessons_ctx,
-                                    memory_ctx=_memory_ctx,
-                                    sentiment_ctx=_sentiment_ctx)
+                                    lessons_ctx=lessons_ctx)
                 print(f"   [{dec.get('consensus','?')} consensus]  "
                       f"Bull: {dec.get('bull_arg','')[:60]}...")
                 print(f"   Bear: {dec.get('bear_arg','')[:60]}...")
@@ -1209,8 +1342,6 @@ def main():
                 dec = llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_pos)
             action, qty, conf, reason = dec["action"], dec["quantity"], dec["confidence"], dec["reason"]
             reasoning = dec["reasoning"]
-            dash_state.update_pipeline("arbiter", "OK")
-            append_decision(symbol, action, conf, reason)
 
             print(f"   Conf {conf}% | {reasoning.get('technical','')[:80]}")
             print(f"   Risks: {reasoning.get('risks','N/A')[:80]}")
@@ -1261,17 +1392,11 @@ def main():
                 val = qty * price
                 print(f"   qty={qty}  value=${val:,.0f}  — {reason}")
 
-                # Execute on ai4trade.ai (paper) — Indian market queued for approval
+                # Execute Indian market trades via Zerodha (paper now, live when zerodha_live=true)
                 if market == "in-stock":
-                    trade_id = queue_trade(cfg, symbol, market, action, qty,
-                                           price, conf, reason, ind.get("atr14", 0))
-                    msg_id = send_approval_request(cfg, trade_id, action, symbol,
-                                                    qty, price, conf, reason)
-                    if msg_id:
-                        update_message_id(trade_id, msg_id)
-                    print(f"   → queued for Telegram approval (trade_id={trade_id})")
-                    result       = {"queued": True, "trade_id": trade_id}
-                    alpaca_result = {"skipped": "awaiting approval"}
+                    result = execute_india_trade(cfg, symbol, action, qty, reason,
+                                                 price, ind.get("atr14", 0), dry_run)
+                    alpaca_result = {"skipped": "zerodha"}
                 else:
                     result = execute_trade(token, symbol, market, action, qty, reason, dry_run)
                     # Mirror to Alpaca — BUY stocks get native bracket (stop + target)
@@ -1285,13 +1410,8 @@ def main():
 
                 send_trade_alert(cfg, action, symbol, qty, price, reason, conf,
                                  alpaca_order_id=alpaca_result.get("alpaca_order_id", ""))
-                dash_state.update_pipeline("alpaca", "OK")
                 dash_state.add_trade(action=action, symbol=symbol,
                                      qty=qty, price=price, reason=reason)
-                try:
-                    record_llm_outcome(cfg.get("model", "gpt-4o-mini"), won=(action == "BUY"))
-                except Exception:
-                    pass
 
                 if result and not dry_run:
                     if action == "BUY":
@@ -1420,17 +1540,17 @@ def main():
     sp_open = len(sp_load_positions()) + len(india_sp_load_positions())
     send_run_status(cfg, cash, trades_today, len(load_positions()), sp_open)
 
-    # Final dashboard state update
-    dash_state.set_status("IDLE")
-    dash_state.set_current_symbol("")
-    dash_state.update_positions(list(load_positions().values()))
-
     # Daily summary email at market close
     if is_near_close() and not dry_run:
         print("Near market close — sending daily summary...")
         send_daily_summary(cfg, cash, trades_today, len(load_positions()))
         _, port_val, dd_pct, _ = check_drawdown_circuit(token, cash)
         tg_daily_summary(cfg, trades_today, cash, port_val, dd_pct * 100)
+
+    # Final dashboard state update
+    dash_state.set_status("IDLE")
+    dash_state.set_current_symbol("")
+    dash_state.update_positions(list(load_positions().values()))
 
 
 if __name__ == "__main__":

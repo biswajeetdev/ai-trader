@@ -243,6 +243,29 @@ def _get_client(cfg):
                                   timeout=30.0, max_retries=2), m, f"Ollama/{m}"
     except Exception:
         pass
+    # FreeLLMAPI local proxy — stacks free-tier providers; avoids the GitHub
+    # Models daily cap. GitHub Models stays as the next fallback below.
+    try:
+        from pathlib import Path as _Path
+        import requests as _rq
+        pkey = _Path("~/freellmapi/.unified-key").expanduser().read_text().strip()
+        # Resolve against the live catalog rather than pinning an id here: the
+        # proxy's free-tier pool changes, and a stale pin 400s every debate
+        # round silently. Kept inline to preserve the no-circular-import rule.
+        _cat = _rq.get("http://localhost:3001/v1/models",
+                       headers={"Authorization": f"Bearer {pkey}"}, timeout=5)
+        if not _cat.ok:
+            raise RuntimeError("proxy key rejected")
+        _ids = {m.get("id") for m in _cat.json().get("data", [])}
+        pmodel = next((m for m in ["groq/compound", "groq/compound-mini",
+                                   "openai/gpt-oss-120b", "Meta-Llama-3_3-70B-Instruct"]
+                       if m in _ids), "auto" if "auto" in _ids else None)
+        if not pmodel:
+            raise RuntimeError("proxy catalog empty")
+        return OpenAI(base_url="http://localhost:3001/v1", api_key=pkey,
+                      timeout=60.0, max_retries=2), pmodel, f"FreeLLMAPI/{pmodel}"
+    except Exception:
+        pass
     try:
         key = os.environ.get("GITHUB_TOKEN") or subprocess.check_output(["gh","auth","token"],text=True).strip()
         if key:
