@@ -679,14 +679,17 @@ def llm_decide(symbol, market, ind, fund, macro, cash, cfg, has_position=False):
 
     try:
         resp = _complete(client, model)
+        dec  = _parse_decision(resp.choices[0].message.content)
     except Exception:
         # Reachable-but-unusable backend: retire it and try the next one down
-        # once, rather than skipping this symbol and every one after it.
+        # once, rather than skipping this symbol and every one after it. A reply
+        # with no parseable decision counts as unusable too: proxy-pool models
+        # sometimes answer with step-by-step reasoning and no JSON, which SKIPped
+        # 4 of 11 symbols in the 2026-09-15 dry run with no retry.
         _retire_backend()
         client, model, label = detect_llm_backend()
         resp = _complete(client, model)
-
-    dec        = _parse_decision(resp.choices[0].message.content)
+        dec  = _parse_decision(resp.choices[0].message.content)
     reasoning  = dec.get("reasoning", {})
     confidence = int(reasoning.get("confidence", 0))
     action     = str(dec.get("action","HOLD")).upper().strip()
@@ -1454,6 +1457,18 @@ def main():
             print(f"   → {action}", end="")
 
             if action != "HOLD" and qty > 0:
+                # ── No SELL without a held position ──────────────────────────
+                # SELL is an exit. With nothing held, the market SELL mirrored to
+                # Alpaca opens a short: untracked in positions.json, no stop, no
+                # bracket. The 2026-09-15 dry run would have shorted RBLX and NET
+                # this way. Intentional shorts go through the SHORT action.
+                if action == "SELL" and not has_pos:
+                    print(f"  SKIPPED — SELL on {symbol} but no position is held "
+                          f"(would open an unmanaged short)")
+                    print()
+                    time.sleep(0.5)
+                    continue
+
                 # ── Drawdown circuit breaker: block new BUY only ──────────────
                 if action == "BUY" and dd_halted:
                     print(f"  BLOCKED by drawdown circuit breaker "
