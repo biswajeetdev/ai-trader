@@ -122,11 +122,20 @@ def check_exits() -> list[dict]:
     """Return list of open positions that hit exit conditions."""
     positions = load_positions()
     to_close  = []
+    expired   = []
     today     = date.today()
 
     for symbol, pos in list(positions.items()):
         try:
             dte = (date.fromisoformat(pos["expiry"]) - today).days
+            if dte < 0:
+                # Already past expiry: the broker has retired the OCC contract, so a
+                # buy-to-close fails with "asset not found". Only a successful close
+                # removed an entry, so these were resubmitted every run, forever.
+                # Stop tracking them -- whether one expired worthless or was
+                # assigned is on the broker's record, not something an order can fix.
+                expired.append(symbol)
+                continue
             if dte <= GAMMA_DTE:
                 to_close.append({**pos, "close_reason": f"DTE={dte}", "current_premium": None})
                 continue
@@ -146,5 +155,12 @@ def check_exits() -> list[dict]:
                                  "current_premium": current})
         except Exception:
             pass
+
+    if expired:
+        for symbol in expired:
+            print(f"   [SP] {symbol} expired {positions[symbol]['expiry']} — no longer "
+                  f"tracked; check Alpaca for assignment")
+            positions.pop(symbol)
+        save_positions(positions)   # once, after the loop
 
     return to_close

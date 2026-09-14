@@ -254,11 +254,18 @@ def check_india_exits() -> list[dict]:
     """Return open positions that hit 50%-profit or DTE ≤ 7."""
     positions = load_positions()
     to_close  = []
+    expired   = []
     today     = date.today()
 
     for symbol, pos in list(positions.items()):
         try:
             dte = (date.fromisoformat(pos["expiry"]) - today).days
+            if dte < 0:
+                # Already past expiry: the contract no longer trades, so a close
+                # order can only fail -- and only a successful close removed an
+                # entry, so it was retried every run. Stop tracking it instead.
+                expired.append(symbol)
+                continue
             if dte <= GAMMA_DTE:
                 to_close.append({**pos, "close_reason": f"DTE={dte}",
                                  "current_premium": None})
@@ -287,4 +294,12 @@ def check_india_exits() -> list[dict]:
                                  "current_premium": current})
         except Exception:
             pass
+
+    if expired:
+        for symbol in expired:
+            print(f"   [IN-SP] {symbol} expired {positions[symbol]['expiry']} — no longer "
+                  f"tracked; check the broker for assignment")
+            positions.pop(symbol)
+        save_positions(positions)   # once, after the loop
+
     return to_close
