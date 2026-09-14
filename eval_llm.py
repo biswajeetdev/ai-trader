@@ -34,13 +34,13 @@ import sys, os, json, argparse, warnings, subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import yfinance as yf
 import pandas as pd
 
 warnings.filterwarnings("ignore")
 DIR = Path(__file__).parent
 
 from backtest import compute_all                      # point-in-time indicators (rolling = backward-only)
+from data.history import get_daily                     # resilient OHLCV: cache -> yfinance -> Alpaca
 from signals.debate_brain import debate_decide
 
 
@@ -86,8 +86,8 @@ def eval_symbol(symbol: str, market: str, n_dates: int, horizon: int,
                 years: int, anonymize: bool, cfg: dict) -> list:
     ticker = f"{symbol}-USD" if market == "crypto" else symbol
     end = datetime.today() + timedelta(days=1)
-    df  = yf.download(ticker, start=(end - timedelta(days=365 * years + 1)).strftime("%Y-%m-%d"),
-                      end=end.strftime("%Y-%m-%d"), interval="1d", progress=False, auto_adjust=True)
+    df  = get_daily(ticker, (end - timedelta(days=365 * years + 1)).strftime("%Y-%m-%d"),
+                    end.strftime("%Y-%m-%d"))
     if df.empty or len(df) < 220:
         print(f"  {symbol}: insufficient history — skipped")
         return []
