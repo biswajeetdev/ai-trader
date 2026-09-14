@@ -6,10 +6,10 @@ AI-Trader — Fully Autonomous Edition
 - Profit target: auto-exit at 2:1 reward-to-risk (6×ATR gain)
 - Feedback loop: recent trade outcomes fed back into LLM context
 - Daily email summary at market close
-- LLM backend: Ollama (pendrive) → GitHub Models (free) → Anthropic
+- LLM backend: Ollama (pendrive) → FreeLLMAPI proxy → Groq direct (.env key)
 """
 
-import json, os, subprocess, sys, time, smtplib, requests
+import json, os, sys, time, smtplib, requests
 import yfinance as yf
 import pandas as pd
 from openai import OpenAI
@@ -75,12 +75,32 @@ DIR    = Path(__file__).parent
 CONFIG = DIR / "config.json"
 LOG    = DIR / "log.json"
 EXCEL  = DIR / "holdings.xlsx"
+EQUITY_CSV = DIR / "equity_curve.csv"   # NAV time series for report_perf.py (gitignored)
 # POSITIONS, TRADE_HIST, HWM_FILE, TOKEN_FILE → broker.risk / broker.ai4trade
 
 # ── constants ─────────────────────────────────────────────────────────────────
 LOG_MAX                = 500
 EARNINGS_BLACKOUT_DAYS = 5
 # STOP_LOSS_ATR, PROFIT_TARGET_ATR, MIN_CONFIDENCE, MAX_TRADE_USD live in broker.risk
+
+# ── Equity-curve logger ───────────────────────────────────────────────────────
+def log_equity(equity: float, cash: float) -> None:
+    """Append one NAV point (timestamp, equity, cash, holdings) to equity_curve.csv.
+
+    This is the time series report_perf.py turns into Sharpe/drawdown/win-rate.
+    Best-effort: never let logging break a trading run.
+    """
+    try:
+        holdings   = round(float(equity) - float(cash), 2)
+        row        = f"{datetime.now().isoformat(timespec='seconds')},{round(float(equity),2)},{round(float(cash),2)},{holdings}\n"
+        write_hdr  = not EQUITY_CSV.exists()
+        with open(EQUITY_CSV, "a") as f:
+            if write_hdr:
+                f.write("timestamp,total_equity,cash,holdings\n")
+            f.write(row)
+    except Exception:
+        pass
+
 
 # ── Entry timing gate ─────────────────────────────────────────────────────────
 def _is_good_entry_window() -> bool:
@@ -104,6 +124,20 @@ PROXY_URL     = "http://localhost:3001/v1"
 # the catalog — that is what silently broke every decision from Jun to Aug 2026.
 PROXY_MODELS  = ["groq/compound", "groq/compound-mini",
                  "openai/gpt-oss-120b", "Meta-Llama-3_3-70B-Instruct"]
+GROQ_URL      = "https://api.groq.com/openai/v1"
+# Direct Groq, used when the proxy is down or failing on completions. Resolved
+# against Groq's live catalog the same way as PROXY_MODELS: llama-3.3-70b-versatile
+# and llama-3.1-8b-instant are retired there, so a stale pin would 404 every call.
+# Measured 2026-09-15 on the free tier at the 1500-token decision budget:
+#   gpt-oss-120b / gpt-oss-20b -> finish=stop, JSON mode parses (both are reasoning
+#     models: at 150 tokens they return finish=length with the reply cut off)
+#   qwen/qwen3.8-27b -> 429 "Request too large" (its TPM can't fit a 1500 budget)
+#   groq/compound    -> 413 with response_format=json_object
+GROQ_MODELS   = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+# Groq sits behind Cloudflare, which rejects bare client User-Agents with a 403
+# that reads exactly like a bad key.
+GROQ_UA       = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 GITHUB_MODEL_FAST  = "gpt-4o-mini"  # debate brain: same model, 50 req/min
 
 VALID_ACTIONS = {"BUY", "SELL", "SHORT", "COVER", "HOLD"}
@@ -116,13 +150,6 @@ _LLM_DEAD    = set()  # backend kinds retired this run after a call-time failure
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG + LLM BACKEND
 # ══════════════════════════════════════════════════════════════════════════════
-
-def gh_token():
-    try:
-        return subprocess.check_output(["gh", "auth", "token"], text=True).strip()
-    except Exception:
-        return None
-
 
 def _freellmapi_key():
     """Unified key for the local FreeLLMAPI proxy (free-tier pool). Read from a file
@@ -160,8 +187,40 @@ def _proxy_model(pkey):
     return "auto" if "auto" in catalog else None
 
 
+def _groq_key():
+    """GROQ_API_KEY from ~/ai-trader/.env (git-ignored), else the environment.
+
+    Read from the file first: launchd strips the environment, which is why run.sh
+    exists. Returns None when no key is set, so the Groq tier is simply skipped.
+    """
+    try:
+        for line in (DIR / ".env").read_text().splitlines():
+            if line.startswith("GROQ_API_KEY="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    return value
+    except Exception:
+        pass
+    return os.environ.get("GROQ_API_KEY") or None
+
+
+def _groq_model(key):
+    """First GROQ_MODELS id that Groq currently serves, or None if Groq can't be used."""
+    try:
+        r = requests.get(f"{GROQ_URL}/models", timeout=5,
+                         headers={"Authorization": f"Bearer {key}", "User-Agent": GROQ_UA})
+        if not r.ok:                      # 401 = key revoked or mistyped; fall through
+            return None
+        catalog = {m.get("id") for m in r.json().get("data", [])}
+    except Exception:
+        return None
+    return next((m for m in GROQ_MODELS if m in catalog), None)
+
+
 def detect_llm_backend():
-    """Priority: Ollama local → FreeLLMAPI proxy → GitHub Models. Result cached per process."""
+    """Priority: Ollama local → FreeLLMAPI proxy → Groq direct.
+    Result cached per process; _retire_backend() drops a backend that fails at call time.
+    Raises RuntimeError when none is usable."""
     global _LLM_BACKEND
     if _LLM_BACKEND is not None:
         return _LLM_BACKEND
@@ -188,14 +247,27 @@ def detect_llm_backend():
                             model, f"FreeLLMAPI/{model}")
             return _LLM_BACKEND
 
-    # 3. GitHub Models
-    key = (os.environ.get("GITHUB_TOKEN") or gh_token()) if "github" not in _LLM_DEAD else None
-    if key:
-        _LLM_BACKEND = (OpenAI(base_url="https://models.inference.ai.azure.com", api_key=key),
-                        GITHUB_MODEL, f"{GITHUB_MODEL} via GitHub Models (free)")
-        return _LLM_BACKEND
+    # 3. Groq direct — when the free-tier proxy is down, or reachable but failing
+    #    every completion (its catalog GET can pass while POSTs fail), decisions
+    #    still come from Groq on the user's own key before GitHub Models' limits.
+    gkey = _groq_key() if "groq" not in _LLM_DEAD else None
+    if gkey:
+        model = _groq_model(gkey)
+        if model:
+            _LLM_BACKEND = (OpenAI(base_url=GROQ_URL, api_key=gkey,
+                                   default_headers={"User-Agent": GROQ_UA}),
+                            model, f"Groq/{model} (direct)")
+            return _LLM_BACKEND
 
-    sys.exit("[error] No LLM backend available. Run: gh auth login")
+    # GitHub Models used to be the last tier. It is retired: on 2026-09-15
+    # models.inference.ai.azure.com no longer resolved and models.github.ai answered
+    # HTTP 410 (github_models_retirement_brownout). With no catalog check, that tier
+    # handed back a client that failed every call, so each remaining symbol SKIPped.
+    #
+    # Raise rather than sys.exit(): SystemExit is not an Exception, so it ended the
+    # whole run mid-loop -- stops, partial exits and short-put expiry handling for
+    # the remaining symbols never ran. A RuntimeError SKIPs just the decision.
+    raise RuntimeError("No LLM backend available (FreeLLMAPI proxy and Groq both unusable)")
 
 
 def _retire_backend():
@@ -212,7 +284,8 @@ def _retire_backend():
         return
     label = _LLM_BACKEND[2]
     kind  = ("ollama" if label.startswith("Ollama") else
-             "proxy"  if label.startswith("FreeLLMAPI") else "github")
+             "proxy"  if label.startswith("FreeLLMAPI") else
+             "groq"   if label.startswith("Groq") else "github")
     _LLM_DEAD.add(kind)
     print(f"   [LLM] {label} failing — falling back")
     _LLM_BACKEND = None
@@ -924,11 +997,42 @@ def run_india_short_put_strategy(cfg: dict, watchlist: list,
     return trades
 
 
+def _get_profile_resilient(token, cfg, attempts=3):
+    """ai4trade.ai account profile, retried; falls back to Alpaca paper cash.
+
+    get_profile() raised straight out of main(), so every ai4trade.ai outage ended
+    the run before a single symbol was evaluated -- cron.log has over 130 such
+    tracebacks (DNS failures, read timeouts, connection resets) in Jul-Aug 2026.
+    Transient blips get retried; a longer outage sizes the run off the Alpaca paper
+    account instead. Only if Alpaca is unreachable too does the error propagate.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return get_profile(token)
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(5 * (i + 1))
+    print(f"[warn] ai4trade.ai profile unavailable after {attempts} tries: {str(last)[:120]}")
+    alp = get_alpaca_portfolio(cfg)
+    if alp and "error" not in alp:
+        print("       Sizing this run from the Alpaca paper account instead.")
+        return {"name": "alpaca-fallback", "cash": alp["cash"],
+                "portfolio_value": alp["equity"]}
+    raise last
+
+
 def main():
     dry_run     = "--dry-run" in sys.argv
     force       = "--force"   in sys.argv   # bypass market-hours check
     cfg         = load_config()
-    _, _, label = detect_llm_backend()
+    try:
+        _, _, label = detect_llm_backend()
+    except RuntimeError as e:
+        # No LLM reachable: still run, so stops, partial exits and short-put expiry
+        # handling happen. Each decision then SKIPs instead of the run exiting here.
+        label = f"none — {e}"
     # Pass fast model key to debate brain (avoids 50 req/day gpt-4o limit)
     cfg["_fast_model"] = GITHUB_MODEL_FAST
 
@@ -950,7 +1054,7 @@ def main():
             ["pgrep", "-f", "dashboard/terminal.py"],
             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
         ).returncode == 0
-        if not _already:
+        if not _already and not dry_run:      # a verification run opens no windows
             _sp.Popen(
                 ["osascript", "-e",
                  f'tell app "Terminal" to do script "python3 {_dash}"'],
@@ -970,11 +1074,13 @@ def main():
 
     print("Authenticating...")
     token   = auth(cfg)
-    profile = get_profile(token)
+    profile = _get_profile_resilient(token, cfg)
     cash    = float(profile.get("cash", 100_000))
     print(f"Account : {profile.get('name')}  |  Cash: ${cash:,.2f}\n")
-    dash_state.update_account(equity=float(profile.get("portfolio_value", cash)),
-                               cash=cash)
+    total_equity = float(profile.get("portfolio_value", cash))
+    dash_state.update_account(equity=total_equity, cash=cash)
+    if not dry_run:
+        log_equity(total_equity, cash)     # append NAV point for report_perf.py
 
     # ── Drawdown circuit breaker (persists across runs via portfolio_hwm.json) ─
     dd_halted, port_value, dd_pct, peak = check_drawdown_circuit(token, cash)
@@ -1408,10 +1514,13 @@ def main():
                     print(f"   Alpaca order: {alpaca_result['alpaca_order_id'][:8]}... "
                           f"{alpaca_result.get('status','')}{bracket_info}")
 
-                send_trade_alert(cfg, action, symbol, qty, price, reason, conf,
-                                 alpaca_order_id=alpaca_result.get("alpaca_order_id", ""))
-                dash_state.add_trade(action=action, symbol=symbol,
-                                     qty=qty, price=price, reason=reason)
+                # A dry run places no orders, so it must not announce or record trades:
+                # the Telegram alert and dashboard would report fills that never happened.
+                if not dry_run:
+                    send_trade_alert(cfg, action, symbol, qty, price, reason, conf,
+                                     alpaca_order_id=alpaca_result.get("alpaca_order_id", ""))
+                    dash_state.add_trade(action=action, symbol=symbol,
+                                         qty=qty, price=price, reason=reason)
 
                 if result and not dry_run:
                     if action == "BUY":
@@ -1530,15 +1639,17 @@ def main():
                     "dry_run": dry_run, "cash": cash,
                     "macro": macro, "trades": trades_today})
 
-    try:
-        n = export_excel(token, cash)
-        print(f"Excel updated — {n} positions")
-    except Exception as e:
-        print(f"[warn] Excel: {e}")
+    if not dry_run:                          # a dry run leaves the holdings sheet alone
+        try:
+            n = export_excel(token, cash)
+            print(f"Excel updated — {n} positions")
+        except Exception as e:
+            print(f"[warn] Excel: {e}")
 
-    # Per-run Telegram heartbeat — always fires so user sees the bot is alive
-    sp_open = len(sp_load_positions()) + len(india_sp_load_positions())
-    send_run_status(cfg, cash, trades_today, len(load_positions()), sp_open)
+        # Per-run Telegram heartbeat — fires on every real run so the user sees the
+        # bot is alive; a dry run is not the bot running, so it stays silent.
+        sp_open = len(sp_load_positions()) + len(india_sp_load_positions())
+        send_run_status(cfg, cash, trades_today, len(load_positions()), sp_open)
 
     # Daily summary email at market close
     if is_near_close() and not dry_run:

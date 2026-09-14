@@ -62,12 +62,23 @@ One sentence conclusion. End with: SENTIMENT: BULLISH/NEUTRAL/BEARISH"""
 
 def _call(client, model, system, user_msg, label):
     """Single LLM call — runs in thread."""
+    # 1000, not 150: the proxy pool and Groq are mostly reasoning models, which spend
+    # the budget on a hidden reasoning pass first. Measured 2026-09-15 on gpt-oss-120b:
+    # max_tokens=150 -> finish_reason=length, reply cut off mid-sentence (and the
+    # arbiter's JSON with it); 1500 -> finish_reason=stop.
     resp = client.chat.completions.create(
-        model=model, max_tokens=150, temperature=0.2,
+        model=model, max_tokens=1000, temperature=0.2,
         messages=[{"role":"system","content":system},
                   {"role":"user",  "content":user_msg}]
     )
-    return label, resp.choices[0].message.content.strip()
+    choice  = resp.choices[0]
+    content = (choice.message.content or "").strip()
+    if not content:
+        # An empty reply is a failed call, not an argument; raising lets trader.py
+        # fall back to llm_decide instead of json.loads("") killing the debate.
+        raise RuntimeError(f"{label}: empty reply from {model} "
+                           f"(finish_reason={choice.finish_reason})")
+    return label, content
 
 
 def _run_specialists(client, model, ctx: str) -> dict:
@@ -97,7 +108,12 @@ def debate_decide(symbol, market, ind, fund, macro, cash, social_ctx, insider_ct
     Run bull/bear debate in parallel, arbiter makes final call.
     Returns same format as llm_decide: {action, quantity, confidence, reason, reasoning}
     """
-    client, model, _ = _get_client(cfg)
+    client, model, backend = _get_client(cfg)
+    if backend.startswith("Groq"):
+        # Groq's free tier allows only a few thousand tokens per minute per model, and
+        # a debate is six reasoning-model calls per symbol, so it would hit 429s on the
+        # first asset. Raise so trader.py falls back to llm_decide's single call.
+        raise RuntimeError("debate skipped on Groq direct: using single-call decision")
 
     # Build shared context block
     ctx = f"""Asset: {symbol} ({market})
@@ -228,55 +244,21 @@ SMA50: ${ind['sma50']} (above:{ind['above_sma50']}) | ATR ${ind['atr14']}
 
 
 def _get_client(cfg):
-    """Reuse backend detection from trader without circular import."""
-    import os, subprocess
-    from openai import OpenAI
-    OLLAMA_URL = "http://localhost:11434/v1"
-    try:
-        import requests as _r
-        r = _r.get(f"{OLLAMA_URL.replace('/v1','')}/api/tags", timeout=2)
-        if r.ok:
-            models = {m["name"].split(":")[0] for m in r.json().get("models",[])}
-            for m in ["qwen2.5:32b","deepseek-r1:14b","llama3.1:8b"]:
-                if m.split(":")[0] in models:
-                    return OpenAI(base_url=OLLAMA_URL, api_key="ollama",
-                                  timeout=30.0, max_retries=2), m, f"Ollama/{m}"
-    except Exception:
-        pass
-    # FreeLLMAPI local proxy — stacks free-tier providers; avoids the GitHub
-    # Models daily cap. GitHub Models stays as the next fallback below.
-    try:
-        from pathlib import Path as _Path
-        import requests as _rq
-        pkey = _Path("~/freellmapi/.unified-key").expanduser().read_text().strip()
-        # Resolve against the live catalog rather than pinning an id here: the
-        # proxy's free-tier pool changes, and a stale pin 400s every debate
-        # round silently. Kept inline to preserve the no-circular-import rule.
-        _cat = _rq.get("http://localhost:3001/v1/models",
-                       headers={"Authorization": f"Bearer {pkey}"}, timeout=5)
-        if not _cat.ok:
-            raise RuntimeError("proxy key rejected")
-        _ids = {m.get("id") for m in _cat.json().get("data", [])}
-        pmodel = next((m for m in ["groq/compound", "groq/compound-mini",
-                                   "openai/gpt-oss-120b", "Meta-Llama-3_3-70B-Instruct"]
-                       if m in _ids), "auto" if "auto" in _ids else None)
-        if not pmodel:
-            raise RuntimeError("proxy catalog empty")
-        return OpenAI(base_url="http://localhost:3001/v1", api_key=pkey,
-                      timeout=60.0, max_retries=2), pmodel, f"FreeLLMAPI/{pmodel}"
-    except Exception:
-        pass
-    try:
-        key = os.environ.get("GITHUB_TOKEN") or subprocess.check_output(["gh","auth","token"],text=True).strip()
-        if key:
-            # Use fast model for debate (3 calls/asset) — 50 req/min vs 50 req/day for gpt-4o
-            fast = cfg.get("_fast_model", "gpt-4o-mini")
-            # timeout so throttled GitHub Models calls fail fast instead of hanging indefinitely
-            return OpenAI(base_url="https://models.inference.ai.azure.com", api_key=key,
-                          timeout=30.0, max_retries=2), fast, f"GitHub/{fast}"
-    except Exception:
-        pass
-    ant = os.environ.get("ANTHROPIC_API_KEY") or cfg.get("anthropic_api_key","")
-    if ant:
-        return None, "claude-sonnet-4-6", "Anthropic"
-    raise RuntimeError("No LLM backend")
+    """Use trader.py's backend selection, so the debate honours the same failover.
+
+    This used to re-implement detection. Its proxy check was a GET of the model
+    catalog, which passes even while every completion POST fails, and it never saw
+    the backends trader.py retires at call time -- so the debate re-picked a dead
+    proxy for every symbol, and each debate failed before llm_decide took over.
+
+    Imported lazily to avoid the circular import (as size_position is below). When
+    trader.py runs as a script it is __main__, and a plain `import trader` would
+    load a second copy with its own backend cache and retired set, so prefer the
+    module that is actually running.
+    """
+    import sys
+    running = sys.modules.get("__main__")
+    if running is not None and hasattr(running, "detect_llm_backend"):
+        return running.detect_llm_backend()
+    from trader import detect_llm_backend
+    return detect_llm_backend()

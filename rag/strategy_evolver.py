@@ -9,10 +9,8 @@ PAIRS_SHORT, DIV_CAPTURE, MERGER_ARB, LEVERAGED_ETF_BULL, LEVERAGED_ETF_BEAR
 """
 
 import json
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from openai import OpenAI
 
 CALIB_FILE    = Path(__file__).parent / "strategy_calibration.json"
 TRADE_HISTORY = Path(__file__).parent.parent / "trade_history.json"
@@ -46,11 +44,24 @@ def _save(data: dict) -> None:
 
 
 def _get_client():
+    """(client, model) from trader.py's backend chain, or (None, None).
+
+    This used to build a GitHub Models client on models.inference.ai.azure.com,
+    which stopped resolving when GitHub Models was retired, so every post-mortem
+    came back "unavailable". Prefer the running trader module (it is __main__ when
+    run as a script) so backends retired during the run are shared.
+    """
     try:
-        token = subprocess.check_output(["gh", "auth", "token"], text=True).strip()
-        return OpenAI(base_url="https://models.inference.ai.azure.com", api_key=token)
+        import sys
+        running = sys.modules.get("__main__")
+        if running is not None and hasattr(running, "detect_llm_backend"):
+            client, model, _ = running.detect_llm_backend()
+        else:
+            from trader import detect_llm_backend
+            client, model, _ = detect_llm_backend()
+        return client, model
     except Exception:
-        return None
+        return None, None
 
 
 def get_thompson_score(strategy: str) -> float:
@@ -60,8 +71,8 @@ def get_thompson_score(strategy: str) -> float:
 
 
 def _run_post_mortem(symbol: str, strategy: str, pnl_pct: float,
-                     entry_context: dict, client) -> str:
-    if client is None:
+                     entry_context: dict, client, model: str | None = None) -> str:
+    if client is None or not model:
         return "Post-mortem unavailable"
     try:
         prompt = (
@@ -71,12 +82,15 @@ def _run_post_mortem(symbol: str, strategy: str, pnl_pct: float,
             "In 2 sentences: (1) What signal or condition was most likely wrong at entry? "
             "(2) What rule should the bot follow to avoid this in future?"
         )
+        # 1000, not 120: the proxy pool and Groq are mostly reasoning models, which
+        # spend a small budget on hidden reasoning and return an empty reply.
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=120, temperature=0.3,
+            max_tokens=1000, temperature=0.3,
         )
-        return resp.choices[0].message.content.strip()
+        content = (resp.choices[0].message.content or "").strip()
+        return content or "Post-mortem unavailable"
     except Exception:
         return "Post-mortem unavailable"
 
@@ -93,7 +107,8 @@ def record_strategy_outcome(symbol: str, strategy: str, pnl_pct: float,
     s["total_pnl"] = round(s.get("total_pnl", 0.0) + pnl_pct, 4)
 
     if pnl_pct < -2.0 and entry_context is not None:
-        diagnosis = _run_post_mortem(symbol, strategy, pnl_pct, entry_context, _get_client())
+        client, model = _get_client()
+        diagnosis = _run_post_mortem(symbol, strategy, pnl_pct, entry_context, client, model)
         lesson    = diagnosis.split("(2)")[-1].strip() if "(2)" in diagnosis else diagnosis
         pms = data.setdefault("post_mortems", [])
         pms.append({"date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
