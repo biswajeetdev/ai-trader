@@ -73,6 +73,7 @@ from rag.strategy_evolver        import (
 from rag.trading_memory  import append_decision, get_memory_context, update_outcome
 from signals.sentiment_fetch import get_sentiment
 import dashboard.state as dash_state
+from broker.performance import get_performance_report, format_for_summary as perf_summary
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 DIR    = Path(__file__).parent
@@ -600,6 +601,10 @@ Today's trades:
     if not trades_today:
         body += "  No trades executed today (all HOLD or market closed)\n"
 
+    try:  # analytics must never stop the daily email
+        body += "\n" + perf_summary(get_performance_report()) + "\n"
+    except Exception as e:
+        body += f"\n(performance report unavailable: {e})\n"
     body += "\nDashboard: https://ai4trade.ai/agent/10954"
 
     msg = MIMEText(body)
