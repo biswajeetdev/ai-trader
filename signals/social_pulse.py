@@ -21,13 +21,13 @@ CACHE_TTL  = 30 * 60  # 30 minutes — don't hammer RSS feeds
 # ── Key figures to monitor and their known ticker associations ────────────────
 INFLUENCERS = {
     "Elon Musk": {
-        "query":   "Elon Musk stock buy invest tweet",
-        "tickers": ["TSLA", "DOGE", "BTC", "X", "TWTR", "SPACEX"],
+        "query":   "Elon Musk Tesla xAI AI chip stock buy invest announcement",
+        "tickers": ["TSLA", "DOGE", "BTC", "X", "SPACEX", "NVDA"],
         "weight":  1.0,   # 1.0 = highest impact
     },
     "Donald Trump": {
-        "query":   "Trump tweet stock tariff trade deal",
-        "tickers": ["DJT", "DWAC", "META", "AAPL", "MSFT"],
+        "query":   "Trump tariff trade deal AI chips executive order stock market",
+        "tickers": ["DJT", "DWAC", "META", "AAPL", "MSFT", "NVDA", "PLTR"],
         "weight":  0.9,
     },
     "Cathie Wood": {
@@ -200,10 +200,12 @@ def format_for_llm(signals, symbol):
     relevant = [s for s in signals if symbol in s.get("tickers", [])]
     if not relevant:
         return "No social signals for this asset in last 6 hours."
+    # Latency note: these are RSS news ABOUT statements (minutes–hours old),
+    # not a live tweet feed — treat as confirmation/context, not a fast trigger.
     lines = []
     for s in relevant[:3]:
         lines.append(f"[{s['urgency']}] {s['source']} → {s['direction']} "
-                     f"(score {s['sentiment']}): \"{s['headline'][:120]}\"")
+                     f"(score {s['sentiment']}, ~RSS lag): \"{s['headline'][:120]}\"")
     return "\n".join(lines)
 
 

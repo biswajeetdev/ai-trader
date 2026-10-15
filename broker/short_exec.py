@@ -6,6 +6,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from broker.state_io import atomic_write_json
+
 try:
     from alpaca.trading.client   import TradingClient
     from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
@@ -33,7 +35,7 @@ def _load_shorts() -> dict:
 
 
 def _save_shorts(pos: dict) -> None:
-    SHORT_POS.write_text(json.dumps(pos, indent=2))
+    atomic_write_json(SHORT_POS, pos)
 
 
 def execute_short_sell(cfg, symbol, qty, limit_price=None, dry_run=False) -> dict:
