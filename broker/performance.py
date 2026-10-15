@@ -18,6 +18,11 @@ HWM_FILE   = DIR / "portfolio_hwm.json"
 
 RISK_FREE_ANNUAL = 0.055  # ~5.5% (US T-bill proxy)
 TRADING_DAYS     = 252
+# portfolio_hwm.json["equity_history"] keeps the last ~30 runs of a 30-minute cron (broker/risk.py),
+# about 15 hours of intraday snapshots. Ratios annualised with sqrt(252) are only valid on a DAILY
+# series, so the report leaves Sharpe, Sortino and max drawdown out until one exists.
+EQUITY_HISTORY_IS_DAILY = False
+NEEDS_DAILY = "needs daily equity history"
 
 
 def _load_trades() -> list[dict]:
@@ -49,6 +54,7 @@ def _daily_returns(equity: list[float]) -> np.ndarray:
 
 
 def sharpe_ratio(equity: list[float]) -> Optional[float]:
+    """Annualised Sharpe from a DAILY equity series."""
     rets = _daily_returns(equity)
     if len(rets) < 20:
         return None
@@ -61,18 +67,17 @@ def sharpe_ratio(equity: list[float]) -> Optional[float]:
 
 
 def sortino_ratio(equity: list[float]) -> Optional[float]:
+    """Annualised Sortino from a DAILY equity series. Downside deviation is the root mean square of the
+    below-target returns taken over ALL periods (not the spread of the losing days alone)."""
     rets = _daily_returns(equity)
     if len(rets) < 20:
         return None
     rf_daily  = RISK_FREE_ANNUAL / TRADING_DAYS
     excess    = rets - rf_daily
-    downside  = excess[excess < 0]
-    if len(downside) == 0:
+    downside_dev = float(np.sqrt(np.mean(np.minimum(excess, 0.0) ** 2)))
+    if downside_dev == 0:
         return None
-    downside_std = np.std(downside, ddof=1)
-    if downside_std == 0:
-        return None
-    return round(float(np.mean(excess) / downside_std * math.sqrt(TRADING_DAYS)), 3)
+    return round(float(np.mean(excess) / downside_dev * math.sqrt(TRADING_DAYS)), 3)
 
 
 def max_drawdown(equity: list[float]) -> float:
@@ -90,8 +95,9 @@ def win_rate_and_profit_factor(trades: list[dict]) -> dict:
     if not closed:
         return {"win_rate": None, "profit_factor": None, "total_trades": 0}
 
-    wins   = [t["pnl"] for t in closed if t["pnl"] > 0]
-    losses = [t["pnl"] for t in closed if t["pnl"] <= 0]
+    wins       = [t["pnl"] for t in closed if t["pnl"] > 0]
+    losses     = [t["pnl"] for t in closed if t["pnl"] < 0]
+    breakevens = [t for t in closed if t["pnl"] == 0]
 
     gross_profit = sum(wins)
     gross_loss   = abs(sum(losses))
@@ -103,6 +109,7 @@ def win_rate_and_profit_factor(trades: list[dict]) -> dict:
         "total_trades":   len(closed),
         "winning_trades": len(wins),
         "losing_trades":  len(losses),
+        "breakeven_trades": len(breakevens),
         "avg_win":        round(sum(wins)   / len(wins),   2) if wins   else 0,
         "avg_loss":       round(sum(losses) / len(losses), 2) if losses else 0,
     }
@@ -132,9 +139,11 @@ def get_performance_report() -> dict:
     equity  = _load_equity_history()
     wrf     = win_rate_and_profit_factor(trades)
     hold    = avg_hold_days(trades)
-    sharpe  = sharpe_ratio(equity)
-    sortino = sortino_ratio(equity)
-    mdd     = max_drawdown(equity)
+    if EQUITY_HISTORY_IS_DAILY:
+        sharpe, sortino = sharpe_ratio(equity), sortino_ratio(equity)
+        mdd_pct = round(max_drawdown(equity) * 100, 2)
+    else:
+        sharpe = sortino = mdd_pct = None
 
     recent_pnl = sum(t.get("pnl", 0) or 0 for t in trades[-20:])
     total_pnl  = sum(t.get("pnl", 0) or 0 for t in trades)
@@ -142,18 +151,20 @@ def get_performance_report() -> dict:
     return {
         "sharpe_ratio":       sharpe,
         "sortino_ratio":      sortino,
-        "max_drawdown_pct":   round(mdd * 100, 2),
+        "max_drawdown_pct":   mdd_pct,
         "win_rate_pct":       round(wrf["win_rate"] * 100, 2) if wrf["win_rate"] is not None else None,
         "profit_factor":      wrf["profit_factor"],
         "total_trades":       wrf["total_trades"],
         "winning_trades":     wrf.get("winning_trades"),
         "losing_trades":      wrf.get("losing_trades"),
+        "breakeven_trades":   wrf.get("breakeven_trades"),
         "avg_win_usd":        wrf.get("avg_win"),
         "avg_loss_usd":       wrf.get("avg_loss"),
         "avg_hold_days":      hold,
         "total_pnl_usd":      round(total_pnl, 2),
         "recent_20_pnl_usd":  round(recent_pnl, 2),
         "equity_data_points": len(equity),
+        "equity_metrics_note": None if EQUITY_HISTORY_IS_DAILY else NEEDS_DAILY,
     }
 
 
@@ -162,15 +173,18 @@ def format_for_summary(report: dict) -> str:
     def fmt(val, suffix="", na="N/A"):
         return f"{val}{suffix}" if val is not None else na
 
+    eq_na = report.get("equity_metrics_note") or "N/A"
+
     lines = [
         "── Performance Report ──────────────────",
-        f"  Sharpe    : {fmt(report['sharpe_ratio'])}",
-        f"  Sortino   : {fmt(report['sortino_ratio'])}",
-        f"  Max DD    : {fmt(report['max_drawdown_pct'], '%')}",
+        f"  Sharpe    : {fmt(report['sharpe_ratio'], na=eq_na)}",
+        f"  Sortino   : {fmt(report['sortino_ratio'], na=eq_na)}",
+        f"  Max DD    : {fmt(report['max_drawdown_pct'], '%', na=eq_na)}",
         f"  Win Rate  : {fmt(report['win_rate_pct'], '%')}",
         f"  Pft Factor: {fmt(report['profit_factor'])}",
         f"  Trades    : {report['total_trades']}  "
-        f"(W:{report.get('winning_trades','?')} / L:{report.get('losing_trades','?')})",
+        f"(W:{report.get('winning_trades','?')} / L:{report.get('losing_trades','?')}"
+        f" / BE:{report.get('breakeven_trades','?')})",
         f"  Avg Win   : ${fmt(report['avg_win_usd'])}  "
         f"Avg Loss: ${fmt(report['avg_loss_usd'])}",
         f"  Avg Hold  : {fmt(report['avg_hold_days'], 'd')}",

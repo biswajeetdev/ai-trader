@@ -601,8 +601,10 @@ Today's trades:
     if not trades_today:
         body += "  No trades executed today (all HOLD or market closed)\n"
 
-    perf = get_performance_report()
-    body += "\n" + perf_summary(perf) + "\n"
+    try:  # analytics must never stop the daily email
+        body += "\n" + perf_summary(get_performance_report()) + "\n"
+    except Exception as e:
+        body += f"\n(performance report unavailable: {e})\n"
     body += "\nDashboard: https://ai4trade.ai/agent/10954"
 
     msg = MIMEText(body)
